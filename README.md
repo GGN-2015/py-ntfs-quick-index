@@ -21,6 +21,20 @@ prompts.
 
 ## Install
 
+Install the latest release from PyPI:
+
+```powershell
+python -m pip install py-ntfs-quick-index
+```
+
+Upgrade an existing install:
+
+```powershell
+python -m pip install --upgrade py-ntfs-quick-index
+```
+
+For local development from a checkout:
+
 ```powershell
 python -m pip install -e .
 ```

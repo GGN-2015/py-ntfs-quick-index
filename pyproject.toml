@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-ntfs-quick-index"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast NTFS indexing and search for Windows amd64."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/"
+Homepage = "https://github.com/GGN-2015/py-ntfs-quick-index"
 
 [project.scripts]
 pnqi = "pnqi.cli:main"
@@ -47,4 +47,3 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-
