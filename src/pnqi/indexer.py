@@ -18,6 +18,7 @@ from .db import (
     delete_subtree,
     entry_by_frn,
     entry_by_path,
+    recompute_tree_sizes,
     refresh_descendant_paths,
     require_index,
     row_to_entry,
@@ -56,6 +57,7 @@ USN_REASON_FILE_CREATE = 0x00000100
 USN_REASON_FILE_DELETE = 0x00000200
 USN_REASON_RENAME_OLD_NAME = 0x00001000
 USN_REASON_RENAME_NEW_NAME = 0x00002000
+TREE_SIZE_VERSION = "2"
 
 
 @dataclass
@@ -113,6 +115,41 @@ def _display_name_for_root(root_path: str) -> str:
     if root_path.endswith("\\") and len(root_path) == 3:
         return root_path
     return ntpath.basename(root_path) or root_path
+
+
+def _accumulate_entry_tree_sizes(entries: dict[str, Entry], root_frn: str) -> None:
+    for entry in sorted(entries.values(), key=lambda item: _path_depth(item.path), reverse=True):
+        current = entries[entry.frn]
+        if current.frn == root_frn:
+            continue
+        parent = entries.get(current.parent_frn)
+        if parent is not None and parent.is_dir:
+            entries[parent.frn] = Entry(
+                frn=parent.frn,
+                parent_frn=parent.parent_frn,
+                name=parent.name,
+                path=parent.path,
+                is_dir=parent.is_dir,
+                size=parent.size,
+                tree_size=parent.tree_size + current.tree_size,
+                mtime_ns=parent.mtime_ns,
+                attributes=parent.attributes,
+                usn=parent.usn,
+            )
+
+
+def _repair_index_tree_sizes_if_needed(
+    conn,
+    meta: dict[str, str],
+    *,
+    progress: ProgressCallback | None,
+    token: CancellationToken,
+) -> None:
+    if meta.get("tree_size_version") == TREE_SIZE_VERSION:
+        return
+    report(progress, ProgressUpdate("size-recalc", 0, None, "Recalculating recursive folder sizes"))
+    recompute_tree_sizes(conn, progress=progress, token=token)
+    set_metadata(conn, tree_size_version=TREE_SIZE_VERSION)
 
 
 def _stat_entry(
@@ -309,23 +346,7 @@ def _build_index(
                     ProgressUpdate("stat", considered, len(records), f"Collected {len(entries):,} entries"),
                 )
 
-        for entry in sorted(entries.values(), key=lambda item: _path_depth(item.path), reverse=True):
-            if entry.frn == root_frn:
-                continue
-            parent = entries.get(entry.parent_frn)
-            if parent is not None and parent.is_dir:
-                entries[parent.frn] = Entry(
-                    frn=parent.frn,
-                    parent_frn=parent.parent_frn,
-                    name=parent.name,
-                    path=parent.path,
-                    is_dir=parent.is_dir,
-                    size=parent.size,
-                    tree_size=parent.tree_size + entry.tree_size,
-                    mtime_ns=parent.mtime_ns,
-                    attributes=parent.attributes,
-                    usn=parent.usn,
-                )
+        _accumulate_entry_tree_sizes(entries, root_frn)
 
         conn = connect(temp_path)
         try:
@@ -343,6 +364,7 @@ def _build_index(
                 root_frn=root_frn,
                 journal_id=journal.journal_id,
                 indexed_usn=high_usn,
+                tree_size_version=TREE_SIZE_VERSION,
             )
             count = bulk_insert_entries(
                 conn,
@@ -524,23 +546,7 @@ def _scan_filesystem_subtree(
                     ProgressUpdate("partial-scan", scanned, None, f"Scanned {scanned:,} moved/new entries"),
                 )
 
-    for entry in sorted(entries.values(), key=lambda item: _path_depth(item.path), reverse=True):
-        if entry.frn == root_entry.frn:
-            continue
-        parent = entries.get(entry.parent_frn)
-        if parent is not None and parent.is_dir:
-            entries[parent.frn] = Entry(
-                frn=parent.frn,
-                parent_frn=parent.parent_frn,
-                name=parent.name,
-                path=parent.path,
-                is_dir=parent.is_dir,
-                size=parent.size,
-                tree_size=parent.tree_size + entry.tree_size,
-                mtime_ns=parent.mtime_ns,
-                attributes=parent.attributes,
-                usn=parent.usn,
-            )
+    _accumulate_entry_tree_sizes(entries, root_entry.frn)
     return list(entries.values())
 
 
@@ -695,6 +701,11 @@ def update_index(
             if indexed_usn < journal.lowest_valid_usn:
                 raise IndexInvalidError("The NTFS USN Journal no longer contains all changes; create a new index.")
             if indexed_usn >= journal.next_usn:
+                if meta.get("tree_size_version") != TREE_SIZE_VERSION:
+                    conn.execute("BEGIN IMMEDIATE")
+                    _repair_index_tree_sizes_if_needed(conn, meta, progress=progress, token=token)
+                    stamp_finished_metadata(conn, journal.next_usn)
+                    conn.commit()
                 report(progress, ProgressUpdate("done", 0, 0, "Index is already fresh"))
                 return index_path
             changes = _collect_changes(
@@ -708,6 +719,7 @@ def update_index(
 
         if not changes:
             conn.execute("BEGIN IMMEDIATE")
+            _repair_index_tree_sizes_if_needed(conn, meta, progress=progress, token=token)
             stamp_finished_metadata(conn, journal.next_usn)
             conn.commit()
             report(progress, ProgressUpdate("done", 0, 0, "No changes found"))
@@ -718,6 +730,7 @@ def update_index(
         root_path = meta["root_path"]
         root_frn = meta["root_frn"]
         try:
+            _repair_index_tree_sizes_if_needed(conn, meta, progress=progress, token=token)
             existing_changes: list[_Change] = []
             new_changes: list[_Change] = []
             for change in sorted(changes.values(), key=lambda item: item.first_order):
@@ -811,15 +824,17 @@ def ensure_fresh_index_for_path(
 def search(
     pattern: str,
     *,
+    limit: int = 0,
     progress: ProgressCallback | None = None,
     token: CancellationToken | None = None,
 ) -> list[Entry]:
-    return list(iter_search(pattern, progress=progress, token=token))
+    return list(iter_search(pattern, limit=limit, progress=progress, token=token))
 
 
 def iter_search(
     pattern: str,
     *,
+    limit: int = 0,
     progress: ProgressCallback | None = None,
     token: CancellationToken | None = None,
 ) -> Iterator[Entry]:
@@ -833,18 +848,27 @@ def iter_search(
     try:
         with cancellable_query(conn, token):
             total = count_entries(conn, "path_norm LIKE ? ESCAPE '\\'", (like,))
-            report(progress, ProgressUpdate("search", 0, total, "Searching index"))
-            cursor = conn.execute(
-                "SELECT * FROM entries WHERE path_norm LIKE ? ESCAPE '\\' ORDER BY path_norm",
-                (like,),
-            )
+            effective_total = min(total, limit) if limit > 0 else total
+            report(progress, ProgressUpdate("search", 0, effective_total, "Searching index"))
+            sql = """
+                SELECT * FROM entries
+                WHERE path_norm LIKE ? ESCAPE '\\'
+                ORDER BY tree_size DESC, path_norm
+            """
+            params: tuple[object, ...]
+            if limit > 0:
+                sql += " LIMIT ?"
+                params = (like, limit)
+            else:
+                params = (like,)
+            cursor = conn.execute(sql, params)
             for idx, row in enumerate(cursor, start=1):
                 token.check()
                 found = idx
                 yield row_to_entry(row)
                 if idx % 500 == 0:
-                    report(progress, ProgressUpdate("search", idx, total, f"Found {idx:,} matches"))
-        report(progress, ProgressUpdate("done", found, total, f"Found {found:,} matches"))
+                    report(progress, ProgressUpdate("search", idx, effective_total, f"Found {idx:,} matches"))
+        report(progress, ProgressUpdate("done", found, effective_total, f"Found {found:,} matches"))
     finally:
         conn.close()
 

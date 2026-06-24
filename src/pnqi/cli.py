@@ -122,12 +122,9 @@ def run(argv: list[str] | None = None) -> int:
             index_path = build_index(args.path, progress=progress, token=token)
             print(f"Index written: {index_path}")
         elif args.command == "search":
-            rows = search(args.pattern, progress=progress, token=token)
-            shown = rows if args.limit <= 0 else rows[: args.limit]
-            for entry in shown:
+            rows = search(args.pattern, limit=args.limit, progress=progress, token=token)
+            for entry in rows:
                 print(f"{entry.display_size:>12}  {entry.path}")
-            if args.limit > 0 and len(rows) > args.limit:
-                print(f"... {len(rows) - args.limit} more")
         elif args.command == "sizes":
             rows = list_sizes(args.path, recursive=not args.direct, progress=progress, token=token)
             shown = rows if args.limit <= 0 else rows[: args.limit]

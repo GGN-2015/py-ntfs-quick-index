@@ -4,9 +4,18 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from pnqi.db import (
+    Entry,
+    connect,
+    create_schema,
+    descendant_frns,
+    entry_by_frn,
+    recompute_tree_sizes,
+    upsert_entry,
+)
 from pnqi.formatting import human_size
+from pnqi.indexer import _accumulate_entry_tree_sizes
 from pnqi.pathing import normalize_windows_path, sqlite_like_from_star_pattern
-from pnqi.db import Entry, connect, create_schema, descendant_frns, upsert_entry
 
 
 class FormattingTests(unittest.TestCase):
@@ -48,6 +57,80 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(descendant_frns(conn, "1"), ["2", "3"])
             finally:
                 conn.close()
+
+    def test_recompute_tree_sizes_sums_deep_descendant_files(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            conn = connect(str(Path(temp_dir) / "index.sqlite"))
+            try:
+                create_schema(conn)
+                upsert_entry(conn, Entry("1", "1", "root", "C:\\root", True, 0, 0, 0, 0, 1))
+                upsert_entry(
+                    conn,
+                    Entry("2", "1", "child", "C:\\root\\child", True, 0, 0, 0, 0, 1),
+                )
+                upsert_entry(
+                    conn,
+                    Entry("3", "2", "grand", "C:\\root\\child\\grand", True, 0, 0, 0, 0, 1),
+                )
+                upsert_entry(
+                    conn,
+                    Entry(
+                        "4",
+                        "3",
+                        "empty.bin",
+                        "C:\\root\\child\\grand\\empty.bin",
+                        False,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1,
+                    ),
+                )
+                upsert_entry(
+                    conn,
+                    Entry(
+                        "5",
+                        "3",
+                        "data.bin",
+                        "C:\\root\\child\\grand\\data.bin",
+                        False,
+                        42,
+                        42,
+                        0,
+                        0,
+                        1,
+                    ),
+                )
+                recompute_tree_sizes(conn)
+                self.assertEqual(entry_by_frn(conn, "1").tree_size, 42)  # type: ignore[union-attr]
+                self.assertEqual(entry_by_frn(conn, "2").tree_size, 42)  # type: ignore[union-attr]
+                self.assertEqual(entry_by_frn(conn, "3").tree_size, 42)  # type: ignore[union-attr]
+            finally:
+                conn.close()
+
+    def test_initial_tree_size_accumulator_uses_updated_child_sizes(self) -> None:
+        entries = {
+            "1": Entry("1", "1", "root", "C:\\root", True, 0, 0, 0, 0, 1),
+            "2": Entry("2", "1", "child", "C:\\root\\child", True, 0, 0, 0, 0, 1),
+            "3": Entry("3", "2", "grand", "C:\\root\\child\\grand", True, 0, 0, 0, 0, 1),
+            "4": Entry(
+                "4",
+                "3",
+                "data.bin",
+                "C:\\root\\child\\grand\\data.bin",
+                False,
+                42,
+                42,
+                0,
+                0,
+                1,
+            ),
+        }
+        _accumulate_entry_tree_sizes(entries, "1")
+        self.assertEqual(entries["1"].tree_size, 42)
+        self.assertEqual(entries["2"].tree_size, 42)
+        self.assertEqual(entries["3"].tree_size, 42)
 
 
 if __name__ == "__main__":

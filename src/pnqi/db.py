@@ -248,6 +248,51 @@ def update_ancestor_sizes(conn: sqlite3.Connection, parent_frn: str, delta: int)
         current = next_parent
 
 
+def _path_depth(path: str) -> int:
+    stripped = normalize_windows_path(path).rstrip("\\")
+    if not stripped:
+        return 0
+    return stripped.count("\\")
+
+
+def recompute_tree_sizes(
+    conn: sqlite3.Connection,
+    *,
+    progress: ProgressCallback | None = None,
+    token: CancellationToken | None = None,
+) -> None:
+    rows = conn.execute("SELECT frn, parent_frn, is_dir, size, path FROM entries").fetchall()
+    is_dir = {row["frn"]: bool(row["is_dir"]) for row in rows}
+    parents = {row["frn"]: row["parent_frn"] for row in rows}
+    sizes = {
+        row["frn"]: 0 if bool(row["is_dir"]) else int(row["size"])
+        for row in rows
+    }
+
+    ordered = sorted(rows, key=lambda row: _path_depth(row["path"]), reverse=True)
+    for idx, row in enumerate(ordered, start=1):
+        if token is not None:
+            token.check()
+        frn = row["frn"]
+        parent_frn = parents.get(frn)
+        if parent_frn and parent_frn != frn and is_dir.get(parent_frn, False):
+            sizes[parent_frn] = sizes.get(parent_frn, 0) + sizes.get(frn, 0)
+        if idx % 10000 == 0:
+            report(
+                progress,
+                ProgressUpdate("size-recalc", idx, len(rows), f"Recalculated {idx:,} entries"),
+            )
+
+    conn.executemany(
+        "UPDATE entries SET tree_size = ? WHERE frn = ?",
+        [(tree_size, frn) for frn, tree_size in sizes.items()],
+    )
+    report(
+        progress,
+        ProgressUpdate("size-recalc", len(rows), len(rows), f"Recalculated {len(rows):,} entries"),
+    )
+
+
 def descendant_frns(conn: sqlite3.Connection, root_frn: str, *, include_root: bool = False) -> list[str]:
     rows = conn.execute(
         """

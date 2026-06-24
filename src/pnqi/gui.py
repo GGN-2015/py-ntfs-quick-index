@@ -52,9 +52,10 @@ def _run_process_task(task: str, payload: Any, task_queue: Any, cancel_event: An
             path, staged = payload
             result = build_index_staged(path, progress=progress, token=token, staged=staged)
         elif task == "search":
+            pattern, limit = payload
             chunk: list[Any] = []
             found = 0
-            for entry in iter_search(payload, progress=progress, token=token):
+            for entry in iter_search(pattern, limit=limit, progress=progress, token=token):
                 chunk.append(entry)
                 found += 1
                 if len(chunk) >= 100:
@@ -127,12 +128,23 @@ class PnqiApp(tk.Tk):
         self.pattern_var = tk.StringVar()
         pattern_entry = ttk.Entry(toolbar, textvariable=self.pattern_var)
         pattern_entry.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(toolbar, text="Max rows").grid(row=1, column=2, padx=(6, 0), pady=(8, 0))
+        self.search_limit_var = tk.StringVar(value="1000")
+        limit_spin = ttk.Spinbox(
+            toolbar,
+            from_=0,
+            to=1_000_000,
+            increment=100,
+            width=8,
+            textvariable=self.search_limit_var,
+        )
+        limit_spin.grid(row=1, column=3, padx=(6, 0), pady=(8, 0))
         search_button = ttk.Button(toolbar, text="Search", command=self._run_search)
-        search_button.grid(row=1, column=2, padx=(6, 0), pady=(8, 0))
+        search_button.grid(row=1, column=4, padx=(6, 0), pady=(8, 0))
         sizes_button = ttk.Button(toolbar, text="Sizes", command=self._run_sizes)
-        sizes_button.grid(row=1, column=3, padx=(6, 0), pady=(8, 0))
+        sizes_button.grid(row=1, column=5, padx=(6, 0), pady=(8, 0))
         self.cancel_button = ttk.Button(toolbar, text="Cancel", command=self._cancel_task, state="disabled")
-        self.cancel_button.grid(row=1, column=4, padx=(6, 0), pady=(8, 0))
+        self.cancel_button.grid(row=1, column=6, padx=(6, 0), pady=(8, 0))
 
         self._locked_widgets = [
             folder_entry,
@@ -140,6 +152,7 @@ class PnqiApp(tk.Tk):
             index_button,
             open_button,
             pattern_entry,
+            limit_spin,
             search_button,
             sizes_button,
         ]
@@ -243,10 +256,18 @@ class PnqiApp(tk.Tk):
         if not pattern:
             messagebox.showwarning("Pattern required", "Enter a wildcard path first.")
             return
+        try:
+            limit = int(self.search_limit_var.get().strip() or "0")
+        except ValueError:
+            messagebox.showwarning("Invalid limit", "Max rows must be a non-negative integer.")
+            return
+        if limit < 0:
+            messagebox.showwarning("Invalid limit", "Max rows must be a non-negative integer.")
+            return
         self._run_task(
             "Searching",
             "search",
-            pattern,
+            (pattern, limit),
             self._after_streaming_results,
             stream_results=True,
         )
