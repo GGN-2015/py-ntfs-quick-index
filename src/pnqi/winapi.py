@@ -180,6 +180,15 @@ kernel32.GetFileInformationByHandle.argtypes = [
     ctypes.POINTER(BY_HANDLE_FILE_INFORMATION),
 ]
 kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+kernel32.GetLogicalDrives.argtypes = []
+kernel32.GetLogicalDrives.restype = wintypes.DWORD
+
+
+def logical_drive_roots() -> list[str]:
+    mask = int(kernel32.GetLogicalDrives())
+    if mask == 0:
+        raise_last_error("GetLogicalDrives failed")
+    return [f"{chr(ord('A') + index)}:\\" for index in range(26) if mask & (1 << index)]
 
 
 def get_volume_info(path: str) -> VolumeInfo:

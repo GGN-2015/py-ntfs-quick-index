@@ -75,15 +75,17 @@ pnqi-gui
 ```
 
 The GUI supports creating indexes, searching wildcard paths, browsing indexed
-folders, and viewing recursive sizes. The folder browser shows each direct
-child's share of the current folder's total recursive size; search and size
-result lists stay focused on size, type, time, and path. During long operations
-the interface is locked except for Cancel. Long tasks run in a worker process so
-NTFS MFT scans and indexed searches do not stall the Tk event loop. Search
-results stream back in small batches so large result sets remain cancellable,
-and the Max rows control limits how many sorted matches are displayed. Cancelled
-index builds write only to a temporary SQLite file and do not replace the
-existing index.
+folders, and viewing recursive sizes. On launch, the GUI asks which local drive
+to load, refreshes that drive's index state, and starts browsing from the drive
+root. Use Change Drive to switch disks; searches are constrained to the selected
+drive. The folder browser shows each direct child's share of the current
+folder's total recursive size; search and size result lists stay focused on
+size, type, time, and path. During long operations the interface is locked
+except for Cancel. Long tasks run in a worker process so NTFS MFT scans and
+indexed searches do not stall the Tk event loop. Search results stream back in
+small batches so large result sets remain cancellable, and the Max rows control
+limits how many sorted matches are displayed. Cancelled index builds write only
+to a temporary SQLite file and do not replace the existing index.
 
 ## Build a GUI EXE
 
@@ -99,10 +101,10 @@ It does not change the Poetry package configuration or runtime dependencies.
 
 ## Incremental Updates
 
-On startup, and before searches or browsing, `pnqi` checks existing
-`pnqi.index.sqlite` files and replays USN Journal changes into SQLite. Folder
-sizes are maintained as recursive sums of all descendant files; older indexes are
-recalculated once when opened. Incremental updates replace stale records that
-still occupy a normalized path before writing the new file record. If the USN
-Journal was recreated or no longer contains the required history, `pnqi` reports
-that the index must be recreated.
+When a GUI drive is selected, and before searches or browsing, `pnqi` checks the
+drive's existing `pnqi.index.sqlite` file and replays USN Journal changes into
+SQLite. Folder sizes are maintained as recursive sums of all descendant files;
+older indexes are recalculated once when opened. Incremental updates replace
+stale records that still occupy a normalized path before writing the new file
+record. If the USN Journal was recreated or no longer contains the required
+history, `pnqi` reports that the index must be recreated.

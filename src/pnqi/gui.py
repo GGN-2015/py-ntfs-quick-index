@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import multiprocessing
+import ntpath
 import queue
 import sys
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Callable
 
 from .admin import ensure_startup_admin, without_elevated_flag
@@ -20,9 +21,10 @@ from .indexer import (
     iter_search,
     list_sizes,
     planned_staged_index,
-    refresh_known_indexes,
 )
+from .pathing import normalize_for_match, normalize_windows_path
 from .progress import CancellationToken, ProgressUpdate
+from .winapi import logical_drive_roots
 
 
 class _QueuedProgress:
@@ -46,9 +48,7 @@ def _run_process_task(task: str, payload: Any, task_queue: Any, cancel_event: An
     token = CancellationToken(cancel_event)
     progress = _QueuedProgress(task_queue)
     try:
-        if task == "refresh":
-            result = refresh_known_indexes(progress=progress, token=token)
-        elif task == "index":
+        if task == "index":
             path, staged = payload
             result = build_index_staged(path, progress=progress, token=token, staged=staged)
         elif task == "search":
@@ -73,11 +73,43 @@ def _run_process_task(task: str, payload: Any, task_queue: Any, cancel_event: An
     except OperationCancelled:
         task_queue.put(("cancelled", None))
     except PnqiError as exc:
-        task_queue.put(("error", ("pnqi", str(exc))))
+        task_queue.put(("error", ("pnqi", exc.__class__.__name__, str(exc))))
     except BaseException as exc:
-        task_queue.put(("error", ("unexpected", repr(exc))))
+        task_queue.put(("error", ("unexpected", exc.__class__.__name__, repr(exc))))
     else:
         task_queue.put(("done", result))
+
+
+class _DriveSelectDialog(simpledialog.Dialog):
+    def __init__(self, parent: tk.Tk, drives: list[str], initial: str | None = None) -> None:
+        self._drives = drives
+        self._initial = initial if initial in drives else drives[0]
+        self.drive_var = tk.StringVar(value=self._initial)
+        self.result: str | None = None
+        super().__init__(parent, "Select Drive")
+
+    def body(self, master: tk.Widget) -> tk.Widget:
+        ttk.Label(master, text="Drive").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        combo = ttk.Combobox(
+            master,
+            values=self._drives,
+            textvariable=self.drive_var,
+            state="readonly",
+            width=12,
+        )
+        combo.grid(row=0, column=1, sticky="ew", pady=(0, 8))
+        master.columnconfigure(1, weight=1)
+        return combo
+
+    def validate(self) -> bool:
+        drive = self.drive_var.get().strip()
+        if not drive:
+            messagebox.showwarning("Drive required", "Choose a drive first.", parent=self)
+            return False
+        return True
+
+    def apply(self) -> None:
+        self.result = self.drive_var.get().strip()
 
 
 class PnqiApp(tk.Tk):
@@ -90,11 +122,15 @@ class PnqiApp(tk.Tk):
         self._task_process: multiprocessing.Process | None = None
         self._task_cancel_event: Any | None = None
         self._task_done: Callable[[Any], None] | None = None
+        self._task_name: str | None = None
+        self._task_payload: Any = None
         self._task_staged_index: StagedIndex | None = None
         self._task_cancelling = False
         self._streaming_results = False
         self._streamed_result_count = 0
         self._locked_widgets: list[tk.Widget] = []
+        self._volume_root: str | None = None
+        self.drive_var = tk.StringVar(value="No drive selected")
         self._current_browse_path = tk.StringVar()
         self._status_var = tk.StringVar(value="Ready")
         self._progress_var = tk.DoubleVar(value=0)
@@ -103,7 +139,7 @@ class PnqiApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(80, self._drain_queue)
         if not skip_startup_refresh:
-            self.after(250, self._startup_refresh)
+            self.after(250, self._startup_select_drive)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -113,16 +149,16 @@ class PnqiApp(tk.Tk):
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(1, weight=1)
 
-        ttk.Label(toolbar, text="Folder").grid(row=0, column=0, padx=(0, 6))
-        self.folder_var = tk.StringVar()
-        folder_entry = ttk.Entry(toolbar, textvariable=self.folder_var)
-        folder_entry.grid(row=0, column=1, sticky="ew")
-        browse_button = ttk.Button(toolbar, text="Choose", command=self._choose_folder)
-        browse_button.grid(row=0, column=2, padx=(6, 0))
-        index_button = ttk.Button(toolbar, text="Create Index", command=self._create_index)
+        ttk.Label(toolbar, text="Drive").grid(row=0, column=0, padx=(0, 6))
+        ttk.Label(toolbar, textvariable=self.drive_var, relief="sunken", padding=(6, 2)).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+        )
+        change_drive_button = ttk.Button(toolbar, text="Change Drive", command=self._change_drive)
+        change_drive_button.grid(row=0, column=2, padx=(6, 0))
+        index_button = ttk.Button(toolbar, text="Create/Rebuild Index", command=self._create_index)
         index_button.grid(row=0, column=3, padx=(6, 0))
-        open_button = ttk.Button(toolbar, text="Open", command=self._open_folder)
-        open_button.grid(row=0, column=4, padx=(6, 0))
 
         ttk.Label(toolbar, text="Pattern").grid(row=1, column=0, padx=(0, 6), pady=(8, 0))
         self.pattern_var = tk.StringVar()
@@ -147,10 +183,8 @@ class PnqiApp(tk.Tk):
         self.cancel_button.grid(row=1, column=6, padx=(6, 0), pady=(8, 0))
 
         self._locked_widgets = [
-            folder_entry,
-            browse_button,
+            change_drive_button,
             index_button,
-            open_button,
             pattern_entry,
             limit_spin,
             search_button,
@@ -225,20 +259,49 @@ class PnqiApp(tk.Tk):
         self.progress.grid(row=0, column=1, sticky="ew", padx=(10, 0))
         status.columnconfigure(1, weight=1)
 
-    def _choose_folder(self) -> None:
-        selected = filedialog.askdirectory()
-        if selected:
-            self.folder_var.set(selected)
-            if not self.pattern_var.get():
-                self.pattern_var.set(selected.rstrip("\\/") + "\\*")
+    def _startup_select_drive(self) -> None:
+        self._choose_drive(startup=True)
 
-    def _startup_refresh(self) -> None:
-        self._run_task("Refreshing existing indexes", "refresh", None)
+    def _change_drive(self) -> None:
+        self._choose_drive(startup=False)
+
+    def _choose_drive(self, *, startup: bool) -> None:
+        if self._is_task_running():
+            return
+        try:
+            drives = logical_drive_roots()
+        except PnqiError as exc:
+            messagebox.showerror("pnqi", str(exc))
+            if startup:
+                self.destroy()
+            return
+        if not drives:
+            messagebox.showerror("pnqi", "No drives were found.")
+            if startup:
+                self.destroy()
+            return
+        dialog = _DriveSelectDialog(self, drives, self._volume_root)
+        drive = dialog.result
+        if drive is None:
+            if startup and self._volume_root is None:
+                self.destroy()
+            return
+        self._load_drive(drive)
+
+    def _load_drive(self, drive: str) -> None:
+        root = normalize_windows_path(drive)
+        self._volume_root = root
+        self.drive_var.set(root)
+        self._current_browse_path.set(root)
+        self.pattern_var.set(root + "*")
+        self.tree.delete(*self.tree.get_children())
+        self.results.delete(*self.results.get_children())
+        self._browse(root)
 
     def _create_index(self) -> None:
-        path = self.folder_var.get().strip()
+        path = self._volume_root
         if not path:
-            messagebox.showwarning("Folder required", "Choose a folder first.")
+            messagebox.showwarning("Drive required", "Choose a drive first.")
             return
         try:
             staged = planned_staged_index(path)
@@ -247,17 +310,18 @@ class PnqiApp(tk.Tk):
             return
         self._run_task("Creating index", "index", (path, staged), self._after_index, staged_index=staged)
 
-    def _open_folder(self) -> None:
-        path = self.folder_var.get().strip()
-        if not path:
-            messagebox.showwarning("Folder required", "Choose a folder first.")
-            return
-        self._browse(path)
-
     def _run_search(self) -> None:
-        pattern = self.pattern_var.get().strip()
-        if not pattern:
+        if self._volume_root is None:
+            messagebox.showwarning("Drive required", "Choose a drive first.")
+            return
+        raw_pattern = self.pattern_var.get().strip()
+        if not raw_pattern:
             messagebox.showwarning("Pattern required", "Enter a wildcard path first.")
+            return
+        try:
+            pattern = self._pattern_in_selected_drive(raw_pattern)
+        except PnqiError as exc:
+            messagebox.showwarning("Invalid pattern", str(exc))
             return
         try:
             limit = int(self.search_limit_var.get().strip() or "0")
@@ -276,18 +340,23 @@ class PnqiApp(tk.Tk):
         )
 
     def _run_sizes(self) -> None:
-        path = self.folder_var.get().strip() or self._current_browse_path.get().strip()
+        path = self._current_browse_path.get().strip()
         if not path:
-            messagebox.showwarning("Folder required", "Choose a folder first.")
+            messagebox.showwarning("Drive required", "Choose a drive first.")
             return
         self._run_task("Loading sizes", "sizes", path, self._show_results)
 
     def _browse(self, path: str) -> None:
+        if self._volume_root is not None and not self._is_inside_selected_drive(path):
+            messagebox.showwarning("Outside drive", "Choose another drive before browsing that path.")
+            return
         self._run_task("Loading folder", "browse", path, self._show_browse)
 
     def _browse_up(self) -> None:
         current = self._current_browse_path.get().strip()
         if not current:
+            return
+        if self._volume_root is not None and normalize_for_match(current) == normalize_for_match(self._volume_root):
             return
         parent = current.rstrip("\\/")
         if len(parent) <= 2:
@@ -316,8 +385,27 @@ class PnqiApp(tk.Tk):
             return
         values = self.results.item(item, "values")
         if len(values) >= 4 and values[1] == "Folder":
-            self.folder_var.set(values[3])
             self._browse(values[3])
+
+    def _pattern_in_selected_drive(self, pattern: str) -> str:
+        if self._volume_root is None:
+            raise PnqiError("Choose a drive first.")
+        pattern = pattern.replace("/", "\\")
+        drive, _tail = ntpath.splitdrive(pattern)
+        if drive:
+            resolved = normalize_windows_path(pattern)
+        else:
+            resolved = normalize_windows_path(self._volume_root + pattern.lstrip("\\"))
+        if not self._is_inside_selected_drive(resolved):
+            raise PnqiError("Search patterns must stay inside the selected drive.")
+        return resolved
+
+    def _is_inside_selected_drive(self, path: str) -> bool:
+        if self._volume_root is None:
+            return False
+        root = normalize_for_match(self._volume_root).rstrip("\\") + "\\"
+        candidate = normalize_for_match(path).rstrip("\\") + "\\"
+        return candidate.startswith(root)
 
     def _run_task(
         self,
@@ -335,6 +423,8 @@ class PnqiApp(tk.Tk):
         cancel_event = multiprocessing.Event()
         self._task_cancel_event = cancel_event
         self._task_done = done
+        self._task_name = task
+        self._task_payload = payload
         self._task_staged_index = staged_index
         self._task_cancelling = False
         self._streaming_results = stream_results
@@ -421,6 +511,8 @@ class PnqiApp(tk.Tk):
         done = self._task_done
         staged = self._task_staged_index
         self._task_done = None
+        self._task_name = None
+        self._task_payload = None
         self._task_staged_index = None
         self._task_cancelling = False
         self._streaming_results = False
@@ -444,6 +536,8 @@ class PnqiApp(tk.Tk):
         if self._task_staged_index is not None:
             discard_staged_index(self._task_staged_index)
         self._task_done = None
+        self._task_name = None
+        self._task_payload = None
         self._task_staged_index = None
         self._task_cancelling = False
         self._streaming_results = False
@@ -454,18 +548,38 @@ class PnqiApp(tk.Tk):
 
     def _finish_error(self, payload: Any) -> None:
         self._join_task_process()
+        task_name = self._task_name
+        task_payload = self._task_payload
         if self._task_staged_index is not None:
             discard_staged_index(self._task_staged_index)
+        self._set_locked(False)
+        self._set_indeterminate(False)
         self._task_done = None
+        self._task_name = None
+        self._task_payload = None
         self._task_staged_index = None
         self._task_cancelling = False
         self._streaming_results = False
-        self._set_locked(False)
-        self._set_indeterminate(False)
-        error_kind, message = payload
+        error_kind = payload[0] if len(payload) >= 1 else "unexpected"
+        error_type = payload[1] if len(payload) >= 3 else "PnqiError"
+        message = payload[2] if len(payload) >= 3 else payload[-1]
         if error_kind == "pnqi":
             self._status_var.set("Error")
-            messagebox.showerror("pnqi", message)
+            if (
+                task_name == "browse"
+                and self._volume_root is not None
+                and isinstance(task_payload, str)
+                and normalize_for_match(task_payload) == normalize_for_match(self._volume_root)
+                and error_type in {"IndexNotFoundError", "IndexInvalidError"}
+            ):
+                create = messagebox.askyesno(
+                    "Index required",
+                    f"{message}\n\nCreate or rebuild the index for {self._volume_root} now?",
+                )
+                if create:
+                    self._create_index()
+            else:
+                messagebox.showerror("pnqi", message)
         else:
             self._status_var.set("Unexpected error")
             messagebox.showerror("pnqi", message)
@@ -516,14 +630,13 @@ class PnqiApp(tk.Tk):
 
     def _after_index(self, index_path: str) -> None:
         self._status_var.set(f"Index written: {index_path}")
-        path = self.folder_var.get().strip()
+        path = self._current_browse_path.get().strip() or self._volume_root
         if path:
             self._browse(path)
 
     def _show_browse(self, payload: tuple[Any, list[Any]]) -> None:
         root, children = payload
         self._current_browse_path.set(root.path)
-        self.folder_var.set(root.path)
         self._fill_browse_tree(children, self._entry_size(root))
 
     def _show_results(self, entries: list[Any]) -> None:
