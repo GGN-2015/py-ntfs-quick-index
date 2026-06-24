@@ -3,6 +3,7 @@ from __future__ import annotations
 import ntpath
 import os
 import string
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -813,12 +814,22 @@ def search(
     progress: ProgressCallback | None = None,
     token: CancellationToken | None = None,
 ) -> list[Entry]:
+    return list(iter_search(pattern, progress=progress, token=token))
+
+
+def iter_search(
+    pattern: str,
+    *,
+    progress: ProgressCallback | None = None,
+    token: CancellationToken | None = None,
+) -> Iterator[Entry]:
     token = token or CancellationToken()
     volume = _volume_for_pattern(pattern)
     index_path = update_index(volume.root, progress=progress, token=token)
     like = sqlite_like_from_star_pattern(pattern)
-    results: list[Entry] = []
     conn = connect(index_path, readonly=True)
+    found = 0
+    total = 0
     try:
         with cancellable_query(conn, token):
             total = count_entries(conn, "path_norm LIKE ? ESCAPE '\\'", (like,))
@@ -829,11 +840,11 @@ def search(
             )
             for idx, row in enumerate(cursor, start=1):
                 token.check()
-                results.append(row_to_entry(row))
+                found = idx
+                yield row_to_entry(row)
                 if idx % 500 == 0:
                     report(progress, ProgressUpdate("search", idx, total, f"Found {idx:,} matches"))
-        report(progress, ProgressUpdate("done", len(results), total, f"Found {len(results):,} matches"))
-        return results
+        report(progress, ProgressUpdate("done", found, total, f"Found {found:,} matches"))
     finally:
         conn.close()
 

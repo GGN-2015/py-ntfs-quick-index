@@ -33,7 +33,10 @@ def ensure_startup_admin(argv: Sequence[str] | None = None, *, gui: bool = False
     child_args = [arg for arg in args if arg != ELEVATED_CHILD_FLAG]
     if gui and "--gui" not in child_args:
         child_args.insert(0, "--gui")
-    command = [sys.executable, "-m", "pnqi", ELEVATED_CHILD_FLAG, *child_args]
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, ELEVATED_CHILD_FLAG, *child_args]
+    else:
+        command = [sys.executable, "-m", "pnqi", ELEVATED_CHILD_FLAG, *child_args]
     try:
         launch(command, cwd=os.getcwd(), wait=False)
     except (AdminLaunchError, OSError) as exc:

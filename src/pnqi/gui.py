@@ -17,10 +17,10 @@ from .indexer import (
     build_index_staged,
     commit_staged_index,
     discard_staged_index,
+    iter_search,
     list_sizes,
     planned_staged_index,
     refresh_known_indexes,
-    search,
 )
 from .progress import CancellationToken, ProgressUpdate
 
@@ -52,7 +52,17 @@ def _run_process_task(task: str, payload: Any, task_queue: Any, cancel_event: An
             path, staged = payload
             result = build_index_staged(path, progress=progress, token=token, staged=staged)
         elif task == "search":
-            result = search(payload, progress=progress, token=token)
+            chunk: list[Any] = []
+            found = 0
+            for entry in iter_search(payload, progress=progress, token=token):
+                chunk.append(entry)
+                found += 1
+                if len(chunk) >= 100:
+                    task_queue.put(("result-chunk", chunk))
+                    chunk = []
+            if chunk:
+                task_queue.put(("result-chunk", chunk))
+            result = {"rows": found}
         elif task == "sizes":
             result = list_sizes(payload, recursive=True, progress=progress, token=token)
         elif task == "browse":
@@ -81,6 +91,8 @@ class PnqiApp(tk.Tk):
         self._task_done: Callable[[Any], None] | None = None
         self._task_staged_index: StagedIndex | None = None
         self._task_cancelling = False
+        self._streaming_results = False
+        self._streamed_result_count = 0
         self._locked_widgets: list[tk.Widget] = []
         self._current_browse_path = tk.StringVar()
         self._status_var = tk.StringVar(value="Ready")
@@ -231,7 +243,13 @@ class PnqiApp(tk.Tk):
         if not pattern:
             messagebox.showwarning("Pattern required", "Enter a wildcard path first.")
             return
-        self._run_task("Searching", "search", pattern, self._show_results)
+        self._run_task(
+            "Searching",
+            "search",
+            pattern,
+            self._after_streaming_results,
+            stream_results=True,
+        )
 
     def _run_sizes(self) -> None:
         path = self.folder_var.get().strip() or self._current_browse_path.get().strip()
@@ -285,6 +303,7 @@ class PnqiApp(tk.Tk):
         done: Callable[[Any], None] | None = None,
         *,
         staged_index: StagedIndex | None = None,
+        stream_results: bool = False,
     ) -> None:
         if self._is_task_running():
             return
@@ -294,10 +313,14 @@ class PnqiApp(tk.Tk):
         self._task_done = done
         self._task_staged_index = staged_index
         self._task_cancelling = False
+        self._streaming_results = stream_results
+        self._streamed_result_count = 0
         self._set_locked(True)
         self._status_var.set(label)
         self._progress_var.set(0)
         self._set_indeterminate(True)
+        if stream_results:
+            self.results.delete(*self.results.get_children())
 
         self._task_process = multiprocessing.Process(
             target=_run_process_task,
@@ -317,14 +340,19 @@ class PnqiApp(tk.Tk):
         self.after(50, self._finish_cancelled_task)
 
     def _drain_queue(self) -> None:
+        handled = 0
         while True:
             try:
                 kind, payload = self._task_queue.get_nowait()
             except queue.Empty:
                 break
+            handled += 1
             if kind == "progress":
                 if not self._task_cancelling:
                     self._handle_progress(payload)
+            elif kind == "result-chunk":
+                if not self._task_cancelling:
+                    self._append_results(payload)
             elif kind == "done":
                 if self._task_cancelling:
                     self._finish_cancelled_task()
@@ -337,6 +365,8 @@ class PnqiApp(tk.Tk):
                     self._finish_cancelled_task()
                 else:
                     self._finish_error(payload)
+            if handled >= 8 and kind in {"progress", "result-chunk"}:
+                break
         self.after(80, self._drain_queue)
 
     def _is_task_running(self) -> bool:
@@ -369,6 +399,7 @@ class PnqiApp(tk.Tk):
         self._task_done = None
         self._task_staged_index = None
         self._task_cancelling = False
+        self._streaming_results = False
         try:
             if staged is not None:
                 result = commit_staged_index(result if isinstance(result, StagedIndex) else staged)
@@ -391,6 +422,7 @@ class PnqiApp(tk.Tk):
         self._task_done = None
         self._task_staged_index = None
         self._task_cancelling = False
+        self._streaming_results = False
         self._clear_task_queue()
         self._set_locked(False)
         self._set_indeterminate(False)
@@ -403,6 +435,7 @@ class PnqiApp(tk.Tk):
         self._task_done = None
         self._task_staged_index = None
         self._task_cancelling = False
+        self._streaming_results = False
         self._set_locked(False)
         self._set_indeterminate(False)
         error_kind, message = payload
@@ -473,8 +506,24 @@ class PnqiApp(tk.Tk):
         self._fill_tree(self.results, entries)
         self._status_var.set(f"{len(entries):,} rows")
 
+    def _append_results(self, entries: list[Any]) -> None:
+        self._insert_entries(self.results, entries)
+        self._streamed_result_count += len(entries)
+        self._status_var.set(f"{self._streamed_result_count:,} rows")
+
+    def _after_streaming_results(self, payload: Any) -> None:
+        count = (
+            payload.get("rows", self._streamed_result_count)
+            if isinstance(payload, dict)
+            else self._streamed_result_count
+        )
+        self._status_var.set(f"{count:,} rows")
+
     def _fill_tree(self, widget: ttk.Treeview, entries: list[Any]) -> None:
         widget.delete(*widget.get_children())
+        self._insert_entries(widget, entries)
+
+    def _insert_entries(self, widget: ttk.Treeview, entries: list[Any]) -> None:
         for entry in entries:
             kind = "Folder" if entry.is_dir else "File"
             size = human_size(entry.tree_size if entry.is_dir else entry.size)

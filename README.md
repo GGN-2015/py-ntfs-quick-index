@@ -76,8 +76,21 @@ pnqi-gui
 The GUI supports creating indexes, searching wildcard paths, browsing indexed
 folders, and viewing recursive sizes. During long operations the interface is
 locked except for Cancel. Long tasks run in a worker process so NTFS MFT scans
-do not stall the Tk event loop. Cancelled index builds write only to a temporary
-SQLite file and do not replace the existing index.
+and indexed searches do not stall the Tk event loop. Search results stream back
+in small batches so large result sets remain cancellable. Cancelled index builds
+write only to a temporary SQLite file and do not replace the existing index.
+
+## Build a GUI EXE
+
+To build the GUI as a single-file Windows executable from a checkout:
+
+```bat
+scripts\build_gui_exe.bat
+```
+
+The script creates an isolated build virtual environment under `.build`, installs
+the current project and PyInstaller there, and writes `dist\exe\pnqi-gui.exe`.
+It does not change the Poetry package configuration or runtime dependencies.
 
 ## Incremental Updates
 
