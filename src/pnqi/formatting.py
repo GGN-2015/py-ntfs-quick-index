@@ -22,6 +22,14 @@ def human_size(size: int) -> str:
     return f"{text} {UNITS[unit_index]}"
 
 
+def human_percent(part: int, total: int) -> str:
+    if total <= 0:
+        return "0%"
+    value = max(part, 0) / total * 100.0
+    text = f"{value:.3f}".rstrip("0").rstrip(".")
+    return f"{text}%"
+
+
 def human_mtime(mtime_ns: int) -> str:
     if mtime_ns <= 0:
         return ""

@@ -75,12 +75,15 @@ pnqi-gui
 ```
 
 The GUI supports creating indexes, searching wildcard paths, browsing indexed
-folders, and viewing recursive sizes. During long operations the interface is
-locked except for Cancel. Long tasks run in a worker process so NTFS MFT scans
-and indexed searches do not stall the Tk event loop. Search results stream back
-in small batches so large result sets remain cancellable, and the Max rows
-control limits how many sorted matches are displayed. Cancelled index builds
-write only to a temporary SQLite file and do not replace the existing index.
+folders, and viewing recursive sizes. The folder browser shows each direct
+child's share of the current folder's total recursive size; search and size
+result lists stay focused on size, type, time, and path. During long operations
+the interface is locked except for Cancel. Long tasks run in a worker process so
+NTFS MFT scans and indexed searches do not stall the Tk event loop. Search
+results stream back in small batches so large result sets remain cancellable,
+and the Max rows control limits how many sorted matches are displayed. Cancelled
+index builds write only to a temporary SQLite file and do not replace the
+existing index.
 
 ## Build a GUI EXE
 

@@ -13,7 +13,7 @@ from pnqi.db import (
     recompute_tree_sizes,
     upsert_entry,
 )
-from pnqi.formatting import human_size
+from pnqi.formatting import human_percent, human_size
 from pnqi.indexer import _accumulate_entry_tree_sizes
 from pnqi.pathing import normalize_windows_path, sqlite_like_from_star_pattern
 
@@ -23,6 +23,11 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(human_size(999), "999 B")
         self.assertEqual(human_size(1000), "1 KB")
         self.assertEqual(human_size(123456789), "123.457 MB")
+
+    def test_human_percent_uses_compact_decimal_text(self) -> None:
+        self.assertEqual(human_percent(0, 0), "0%")
+        self.assertEqual(human_percent(1, 4), "25%")
+        self.assertEqual(human_percent(1, 3), "33.333%")
 
 
 class PathingTests(unittest.TestCase):

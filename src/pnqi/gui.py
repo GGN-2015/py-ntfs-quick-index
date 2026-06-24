@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from .admin import ensure_startup_admin, without_elevated_flag
 from .errors import OperationCancelled, PnqiError
-from .formatting import human_mtime, human_size
+from .formatting import human_mtime, human_percent, human_size
 from .indexer import (
     StagedIndex,
     browse_children,
@@ -173,18 +173,21 @@ class PnqiApp(tk.Tk):
         ttk.Label(breadcrumb, textvariable=self._current_browse_path).grid(row=0, column=1, sticky="ew")
         self._locked_widgets.append(up_button)
 
-        columns = ("size", "kind", "mtime", "path")
-        self.tree = ttk.Treeview(left, columns=columns, show="tree headings", selectmode="browse")
+        browse_columns = ("size", "share", "kind", "mtime", "path")
+        result_columns = ("size", "kind", "mtime", "path")
+        self.tree = ttk.Treeview(left, columns=browse_columns, show="tree headings", selectmode="browse")
         self.tree.heading("#0", text="Name")
         self.tree.heading("size", text="Size")
+        self.tree.heading("share", text="Share")
         self.tree.heading("kind", text="Type")
         self.tree.heading("mtime", text="Modified")
         self.tree.heading("path", text="Path")
         self.tree.column("#0", width=230, stretch=True)
         self.tree.column("size", width=100, anchor="e", stretch=False)
+        self.tree.column("share", width=80, anchor="e", stretch=False)
         self.tree.column("kind", width=80, stretch=False)
         self.tree.column("mtime", width=150, anchor="e", stretch=False)
-        self.tree.column("path", width=360, stretch=True)
+        self.tree.column("path", width=320, stretch=True)
         self.tree.grid(row=2, column=0, sticky="nsew")
         self.tree.bind("<Double-1>", self._tree_double_click)
         tree_scroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tree.yview)
@@ -196,7 +199,7 @@ class PnqiApp(tk.Tk):
         right.rowconfigure(1, weight=1)
         paned.add(right, weight=2)
         ttk.Label(right, text="Search and size results").grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self.results = ttk.Treeview(right, columns=columns, show="tree headings")
+        self.results = ttk.Treeview(right, columns=result_columns, show="tree headings")
         self.results.heading("#0", text="Name")
         self.results.heading("size", text="Size")
         self.results.heading("kind", text="Type")
@@ -302,8 +305,8 @@ class PnqiApp(tk.Tk):
         if not item:
             return
         values = self.tree.item(item, "values")
-        if len(values) >= 4 and values[1] == "Folder":
-            self._browse(values[3])
+        if len(values) >= 5 and values[2] == "Folder":
+            self._browse(values[4])
 
     def _results_double_click(self, _event: object) -> None:
         if self._is_task_running():
@@ -521,7 +524,7 @@ class PnqiApp(tk.Tk):
         root, children = payload
         self._current_browse_path.set(root.path)
         self.folder_var.set(root.path)
-        self._fill_tree(self.tree, children)
+        self._fill_browse_tree(children, self._entry_size(root))
 
     def _show_results(self, entries: list[Any]) -> None:
         self._fill_tree(self.results, entries)
@@ -544,10 +547,25 @@ class PnqiApp(tk.Tk):
         widget.delete(*widget.get_children())
         self._insert_entries(widget, entries)
 
+    def _fill_browse_tree(self, entries: list[Any], total_size: int) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for entry in entries:
+            kind = "Folder" if entry.is_dir else "File"
+            size_bytes = self._entry_size(entry)
+            size = human_size(size_bytes)
+            share = human_percent(size_bytes, total_size)
+            name = entry.name or entry.path
+            self.tree.insert(
+                "",
+                "end",
+                text=name,
+                values=(size, share, kind, human_mtime(entry.mtime_ns), entry.path),
+            )
+
     def _insert_entries(self, widget: ttk.Treeview, entries: list[Any]) -> None:
         for entry in entries:
             kind = "Folder" if entry.is_dir else "File"
-            size = human_size(entry.tree_size if entry.is_dir else entry.size)
+            size = human_size(self._entry_size(entry))
             name = entry.name or entry.path
             widget.insert(
                 "",
@@ -555,6 +573,10 @@ class PnqiApp(tk.Tk):
                 text=name,
                 values=(size, kind, human_mtime(entry.mtime_ns), entry.path),
             )
+
+    @staticmethod
+    def _entry_size(entry: Any) -> int:
+        return int(entry.tree_size if entry.is_dir else entry.size)
 
 
 def main(argv: list[str] | None = None) -> int:
