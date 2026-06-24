@@ -77,6 +77,13 @@ class _Change:
     delete_record: UsnRecord | None = None
 
 
+@dataclass(frozen=True)
+class StagedIndex:
+    final_path: str
+    temp_path: str
+    entry_count: int = 0
+
+
 def _frn(value: int | str) -> str:
     return str(value)
 
@@ -177,12 +184,30 @@ def _cleanup_temp_index(temp_path: str) -> None:
             pass
 
 
-def build_index(
+def planned_staged_index(root_path: str) -> StagedIndex:
+    validate_supported_platform()
+    require_admin()
+    _root_path, final_path, _volume = _resolve_index_path_for_existing_path(root_path)
+    return StagedIndex(final_path=final_path, temp_path=temporary_index_path(final_path))
+
+
+def commit_staged_index(staged: StagedIndex) -> str:
+    _replace_index(staged.temp_path, staged.final_path)
+    return staged.final_path
+
+
+def discard_staged_index(staged: StagedIndex) -> None:
+    _cleanup_temp_index(staged.temp_path)
+
+
+def _build_index(
     root_path: str,
     *,
     progress: ProgressCallback | None = None,
     token: CancellationToken | None = None,
-) -> str:
+    commit: bool,
+    staged: StagedIndex | None = None,
+) -> str | StagedIndex:
     validate_supported_platform()
     require_admin()
     token = token or CancellationToken()
@@ -192,7 +217,12 @@ def build_index(
     if root_id.volume_serial != volume.serial:
         raise PnqiError(f"{root_path} is not on {volume.root}.")
 
-    temp_path = temporary_index_path(final_path)
+    if staged is not None:
+        if normalize_for_match(staged.final_path) != normalize_for_match(final_path):
+            raise PnqiError("Staged index target does not match the requested folder.")
+        temp_path = staged.temp_path
+    else:
+        temp_path = temporary_index_path(final_path)
     _cleanup_temp_index(temp_path)
     report(progress, ProgressUpdate("start", 0, None, f"Index file: {final_path}"))
 
@@ -330,12 +360,40 @@ def build_index(
         finally:
             conn.close()
         token.check()
-        _replace_index(temp_path, final_path)
-        report(progress, ProgressUpdate("done", count, count, f"Indexed {count:,} entries"))
-        return final_path
+        if commit:
+            _replace_index(temp_path, final_path)
+            report(progress, ProgressUpdate("done", count, count, f"Indexed {count:,} entries"))
+            return final_path
+        report(progress, ProgressUpdate("ready", count, count, f"Built {count:,} entries"))
+        return StagedIndex(final_path=final_path, temp_path=temp_path, entry_count=count)
     except BaseException:
         _cleanup_temp_index(temp_path)
         raise
+
+
+def build_index(
+    root_path: str,
+    *,
+    progress: ProgressCallback | None = None,
+    token: CancellationToken | None = None,
+) -> str:
+    result = _build_index(root_path, progress=progress, token=token, commit=True)
+    if not isinstance(result, str):
+        raise PnqiError("Internal error: index build returned an uncommitted staged index.")
+    return result
+
+
+def build_index_staged(
+    root_path: str,
+    *,
+    progress: ProgressCallback | None = None,
+    token: CancellationToken | None = None,
+    staged: StagedIndex | None = None,
+) -> StagedIndex:
+    result = _build_index(root_path, progress=progress, token=token, commit=False, staged=staged)
+    if not isinstance(result, StagedIndex):
+        raise PnqiError("Internal error: staged index build returned a committed path.")
+    return result
 
 
 def _collect_changes(

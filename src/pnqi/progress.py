@@ -19,15 +19,15 @@ ProgressCallback = Callable[[ProgressUpdate], None]
 
 
 class CancellationToken:
-    def __init__(self) -> None:
-        self._event = Event()
+    def __init__(self, event: object | None = None) -> None:
+        self._event = Event() if event is None else event
 
     def cancel(self) -> None:
-        self._event.set()
+        self._event.set()  # type: ignore[attr-defined]
 
     @property
     def cancelled(self) -> bool:
-        return self._event.is_set()
+        return bool(self._event.is_set())  # type: ignore[attr-defined]
 
     def check(self) -> None:
         if self.cancelled:
@@ -41,4 +41,3 @@ class SupportsProgress(Protocol):
 def report(progress: ProgressCallback | None, update: ProgressUpdate) -> None:
     if progress is not None:
         progress(update)
-

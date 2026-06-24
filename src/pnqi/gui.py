@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import multiprocessing
 import queue
 import sys
-import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
@@ -10,8 +11,62 @@ from typing import Any, Callable
 from .admin import ensure_startup_admin, without_elevated_flag
 from .errors import OperationCancelled, PnqiError
 from .formatting import human_mtime, human_size
-from .indexer import browse_children, build_index, list_sizes, refresh_known_indexes, search
+from .indexer import (
+    StagedIndex,
+    browse_children,
+    build_index_staged,
+    commit_staged_index,
+    discard_staged_index,
+    list_sizes,
+    planned_staged_index,
+    refresh_known_indexes,
+    search,
+)
 from .progress import CancellationToken, ProgressUpdate
+
+
+class _QueuedProgress:
+    def __init__(self, task_queue: Any, *, min_interval: float = 0.08) -> None:
+        self._task_queue = task_queue
+        self._min_interval = min_interval
+        self._last_sent = 0.0
+        self._last_stage = ""
+
+    def __call__(self, update: ProgressUpdate) -> None:
+        now = time.monotonic()
+        urgent = update.stage in {"start", "done", "ready"} or update.stage != self._last_stage
+        complete = update.total is not None and update.current == update.total
+        if urgent or complete or now - self._last_sent >= self._min_interval:
+            self._task_queue.put(("progress", update))
+            self._last_sent = now
+            self._last_stage = update.stage
+
+
+def _run_process_task(task: str, payload: Any, task_queue: Any, cancel_event: Any) -> None:
+    token = CancellationToken(cancel_event)
+    progress = _QueuedProgress(task_queue)
+    try:
+        if task == "refresh":
+            result = refresh_known_indexes(progress=progress, token=token)
+        elif task == "index":
+            path, staged = payload
+            result = build_index_staged(path, progress=progress, token=token, staged=staged)
+        elif task == "search":
+            result = search(payload, progress=progress, token=token)
+        elif task == "sizes":
+            result = list_sizes(payload, recursive=True, progress=progress, token=token)
+        elif task == "browse":
+            result = browse_children(payload, progress=progress, token=token)
+        else:
+            raise PnqiError(f"Unknown GUI task: {task}")
+    except OperationCancelled:
+        task_queue.put(("cancelled", None))
+    except PnqiError as exc:
+        task_queue.put(("error", ("pnqi", str(exc))))
+    except BaseException as exc:
+        task_queue.put(("error", ("unexpected", repr(exc))))
+    else:
+        task_queue.put(("done", result))
 
 
 class PnqiApp(tk.Tk):
@@ -20,15 +75,19 @@ class PnqiApp(tk.Tk):
         self.title("py-ntfs-quick-index")
         self.geometry("980x680")
         self.minsize(780, 500)
-        self._task_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
-        self._task_thread: threading.Thread | None = None
-        self._task_token: CancellationToken | None = None
+        self._task_queue: Any = multiprocessing.Queue()
+        self._task_process: multiprocessing.Process | None = None
+        self._task_cancel_event: Any | None = None
+        self._task_done: Callable[[Any], None] | None = None
+        self._task_staged_index: StagedIndex | None = None
+        self._task_cancelling = False
         self._locked_widgets: list[tk.Widget] = []
         self._current_browse_path = tk.StringVar()
         self._status_var = tk.StringVar(value="Ready")
         self._progress_var = tk.DoubleVar(value=0)
         self._progress_indeterminate = False
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(80, self._drain_queue)
         if not skip_startup_refresh:
             self.after(250, self._startup_refresh)
@@ -84,8 +143,10 @@ class PnqiApp(tk.Tk):
         breadcrumb = ttk.Frame(left)
         breadcrumb.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         breadcrumb.columnconfigure(1, weight=1)
-        ttk.Button(breadcrumb, text="Up", command=self._browse_up).grid(row=0, column=0, padx=(0, 6))
+        up_button = ttk.Button(breadcrumb, text="Up", command=self._browse_up)
+        up_button.grid(row=0, column=0, padx=(0, 6))
         ttk.Label(breadcrumb, textvariable=self._current_browse_path).grid(row=0, column=1, sticky="ew")
+        self._locked_widgets.append(up_button)
 
         columns = ("size", "kind", "mtime", "path")
         self.tree = ttk.Treeview(left, columns=columns, show="tree headings", selectmode="browse")
@@ -144,14 +205,19 @@ class PnqiApp(tk.Tk):
                 self.pattern_var.set(selected.rstrip("\\/") + "\\*")
 
     def _startup_refresh(self) -> None:
-        self._run_task("Refreshing existing indexes", lambda token, progress: refresh_known_indexes(progress=progress, token=token))
+        self._run_task("Refreshing existing indexes", "refresh", None)
 
     def _create_index(self) -> None:
         path = self.folder_var.get().strip()
         if not path:
             messagebox.showwarning("Folder required", "Choose a folder first.")
             return
-        self._run_task("Creating index", lambda token, progress: build_index(path, progress=progress, token=token), self._after_index)
+        try:
+            staged = planned_staged_index(path)
+        except PnqiError as exc:
+            messagebox.showerror("pnqi", str(exc))
+            return
+        self._run_task("Creating index", "index", (path, staged), self._after_index, staged_index=staged)
 
     def _open_folder(self) -> None:
         path = self.folder_var.get().strip()
@@ -165,25 +231,17 @@ class PnqiApp(tk.Tk):
         if not pattern:
             messagebox.showwarning("Pattern required", "Enter a wildcard path first.")
             return
-        self._run_task("Searching", lambda token, progress: search(pattern, progress=progress, token=token), self._show_results)
+        self._run_task("Searching", "search", pattern, self._show_results)
 
     def _run_sizes(self) -> None:
         path = self.folder_var.get().strip() or self._current_browse_path.get().strip()
         if not path:
             messagebox.showwarning("Folder required", "Choose a folder first.")
             return
-        self._run_task(
-            "Loading sizes",
-            lambda token, progress: list_sizes(path, recursive=True, progress=progress, token=token),
-            self._show_results,
-        )
+        self._run_task("Loading sizes", "sizes", path, self._show_results)
 
     def _browse(self, path: str) -> None:
-        self._run_task(
-            "Loading folder",
-            lambda token, progress: browse_children(path, progress=progress, token=token),
-            self._show_browse,
-        )
+        self._run_task("Loading folder", "browse", path, self._show_browse)
 
     def _browse_up(self) -> None:
         current = self._current_browse_path.get().strip()
@@ -199,7 +257,7 @@ class PnqiApp(tk.Tk):
         self._browse(parent)
 
     def _tree_double_click(self, _event: object) -> None:
-        if self._task_thread is not None and self._task_thread.is_alive():
+        if self._is_task_running():
             return
         item = self.tree.focus()
         if not item:
@@ -209,7 +267,7 @@ class PnqiApp(tk.Tk):
             self._browse(values[3])
 
     def _results_double_click(self, _event: object) -> None:
-        if self._task_thread is not None and self._task_thread.is_alive():
+        if self._is_task_running():
             return
         item = self.results.focus()
         if not item:
@@ -222,36 +280,41 @@ class PnqiApp(tk.Tk):
     def _run_task(
         self,
         label: str,
-        func: Callable[[CancellationToken, Callable[[ProgressUpdate], None]], Any],
+        task: str,
+        payload: Any,
         done: Callable[[Any], None] | None = None,
+        *,
+        staged_index: StagedIndex | None = None,
     ) -> None:
-        if self._task_thread is not None and self._task_thread.is_alive():
+        if self._is_task_running():
             return
-        token = CancellationToken()
-        self._task_token = token
+        self._clear_task_queue()
+        cancel_event = multiprocessing.Event()
+        self._task_cancel_event = cancel_event
+        self._task_done = done
+        self._task_staged_index = staged_index
+        self._task_cancelling = False
         self._set_locked(True)
         self._status_var.set(label)
         self._progress_var.set(0)
         self._set_indeterminate(True)
 
-        def progress(update: ProgressUpdate) -> None:
-            self._task_queue.put(("progress", update))
-
-        def worker() -> None:
-            try:
-                result = func(token, progress)
-            except BaseException as exc:
-                self._task_queue.put(("error", exc))
-            else:
-                self._task_queue.put(("done", (result, done)))
-
-        self._task_thread = threading.Thread(target=worker, daemon=True)
-        self._task_thread.start()
+        self._task_process = multiprocessing.Process(
+            target=_run_process_task,
+            args=(task, payload, self._task_queue, cancel_event),
+            daemon=True,
+        )
+        self._task_process.start()
 
     def _cancel_task(self) -> None:
-        if self._task_token is not None:
-            self._task_token.cancel()
-            self._status_var.set("Cancelling...")
+        if self._task_cancel_event is not None:
+            self._task_cancel_event.set()
+        self._task_cancelling = True
+        if self._task_process is not None and self._task_process.is_alive():
+            self._task_process.terminate()
+        self.cancel_button.configure(state="disabled")
+        self._status_var.set("Cancelling...")
+        self.after(50, self._finish_cancelled_task)
 
     def _drain_queue(self) -> None:
         while True:
@@ -260,27 +323,105 @@ class PnqiApp(tk.Tk):
             except queue.Empty:
                 break
             if kind == "progress":
-                self._handle_progress(payload)
+                if not self._task_cancelling:
+                    self._handle_progress(payload)
             elif kind == "done":
-                result, callback = payload
-                self._set_locked(False)
-                self._set_indeterminate(False)
-                self._status_var.set("Ready")
-                if callback is not None:
-                    callback(result)
-            elif kind == "error":
-                self._set_locked(False)
-                self._set_indeterminate(False)
-                exc = payload
-                if isinstance(exc, OperationCancelled):
-                    self._status_var.set("Cancelled")
-                elif isinstance(exc, PnqiError):
-                    self._status_var.set("Error")
-                    messagebox.showerror("pnqi", str(exc))
+                if self._task_cancelling:
+                    self._finish_cancelled_task()
                 else:
-                    self._status_var.set("Unexpected error")
-                    messagebox.showerror("pnqi", repr(exc))
+                    self._finish_task(payload)
+            elif kind == "cancelled":
+                self._finish_cancelled_task()
+            elif kind == "error":
+                if self._task_cancelling:
+                    self._finish_cancelled_task()
+                else:
+                    self._finish_error(payload)
         self.after(80, self._drain_queue)
+
+    def _is_task_running(self) -> bool:
+        return self._task_process is not None and self._task_process.is_alive()
+
+    def _clear_task_queue(self) -> None:
+        while True:
+            try:
+                self._task_queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _join_task_process(self) -> None:
+        if self._task_process is not None:
+            self._task_process.join(timeout=1.0)
+            if self._task_process.is_alive():
+                self._task_process.terminate()
+                self._task_process.join(timeout=1.0)
+            if not self._task_process.is_alive():
+                self._task_process.close()
+        self._task_process = None
+        self._task_cancel_event = None
+
+    def _finish_task(self, result: Any) -> None:
+        self._join_task_process()
+        self._set_locked(False)
+        self._set_indeterminate(False)
+        done = self._task_done
+        staged = self._task_staged_index
+        self._task_done = None
+        self._task_staged_index = None
+        self._task_cancelling = False
+        try:
+            if staged is not None:
+                result = commit_staged_index(result if isinstance(result, StagedIndex) else staged)
+            self._status_var.set("Ready")
+            if done is not None:
+                done(result)
+        except PnqiError as exc:
+            self._status_var.set("Error")
+            if staged is not None:
+                discard_staged_index(staged)
+            messagebox.showerror("pnqi", str(exc))
+
+    def _finish_cancelled_task(self) -> None:
+        if self._task_process is not None and self._task_process.is_alive():
+            self.after(50, self._finish_cancelled_task)
+            return
+        self._join_task_process()
+        if self._task_staged_index is not None:
+            discard_staged_index(self._task_staged_index)
+        self._task_done = None
+        self._task_staged_index = None
+        self._task_cancelling = False
+        self._clear_task_queue()
+        self._set_locked(False)
+        self._set_indeterminate(False)
+        self._status_var.set("Cancelled")
+
+    def _finish_error(self, payload: Any) -> None:
+        self._join_task_process()
+        if self._task_staged_index is not None:
+            discard_staged_index(self._task_staged_index)
+        self._task_done = None
+        self._task_staged_index = None
+        self._task_cancelling = False
+        self._set_locked(False)
+        self._set_indeterminate(False)
+        error_kind, message = payload
+        if error_kind == "pnqi":
+            self._status_var.set("Error")
+            messagebox.showerror("pnqi", message)
+        else:
+            self._status_var.set("Unexpected error")
+            messagebox.showerror("pnqi", message)
+
+    def _close(self) -> None:
+        if self._task_process is not None and self._task_process.is_alive():
+            if self._task_cancel_event is not None:
+                self._task_cancel_event.set()
+            self._task_process.terminate()
+            self._task_process.join(timeout=1)
+        if self._task_staged_index is not None:
+            discard_staged_index(self._task_staged_index)
+        self.destroy()
 
     def _handle_progress(self, update: ProgressUpdate) -> None:
         self._status_var.set(update.message or update.stage)
@@ -347,6 +488,7 @@ class PnqiApp(tk.Tk):
 
 
 def main(argv: list[str] | None = None) -> int:
+    multiprocessing.freeze_support()
     raw_args = list(sys.argv[1:] if argv is None else argv)
     if "-h" in raw_args or "--help" in raw_args:
         print("usage: pnqi-gui [--skip-startup-refresh]")
