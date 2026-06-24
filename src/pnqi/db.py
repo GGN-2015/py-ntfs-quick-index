@@ -151,6 +151,13 @@ def entry_by_path(conn: sqlite3.Connection, path: str) -> Entry | None:
 
 
 def upsert_entry(conn: sqlite3.Connection, entry: Entry) -> None:
+    path_norm = normalize_for_match(entry.path)
+    conflicting = conn.execute(
+        "SELECT frn FROM entries WHERE path_norm = ? AND frn != ?",
+        (path_norm, entry.frn),
+    ).fetchone()
+    if conflicting is not None:
+        delete_subtree(conn, conflicting["frn"])
     conn.execute(
         """
         INSERT INTO entries (
@@ -174,7 +181,7 @@ def upsert_entry(conn: sqlite3.Connection, entry: Entry) -> None:
             entry.parent_frn,
             entry.name,
             entry.path,
-            normalize_for_match(entry.path),
+            path_norm,
             int(entry.is_dir),
             entry.size,
             entry.tree_size,
@@ -334,9 +341,16 @@ def refresh_descendant_paths(conn: sqlite3.Connection, root_frn: str) -> None:
         ).fetchall()
         for row in child_rows:
             path = parent.path.rstrip("\\") + "\\" + row["name"]
+            path_norm = normalize_for_match(path)
+            conflicting = conn.execute(
+                "SELECT frn FROM entries WHERE path_norm = ? AND frn != ?",
+                (path_norm, row["frn"]),
+            ).fetchone()
+            if conflicting is not None:
+                delete_subtree(conn, conflicting["frn"])
             conn.execute(
                 "UPDATE entries SET path = ?, path_norm = ? WHERE frn = ?",
-                (normalize_windows_path(path), normalize_for_match(path), row["frn"]),
+                (normalize_windows_path(path), path_norm, row["frn"]),
             )
             queue.append(row["frn"])
 

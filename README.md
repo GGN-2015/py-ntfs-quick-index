@@ -99,5 +99,7 @@ It does not change the Poetry package configuration or runtime dependencies.
 On startup, and before searches or browsing, `pnqi` checks existing
 `pnqi.index.sqlite` files and replays USN Journal changes into SQLite. Folder
 sizes are maintained as recursive sums of all descendant files; older indexes are
-recalculated once when opened. If the USN Journal was recreated or no longer
-contains the required history, `pnqi` reports that the index must be recreated.
+recalculated once when opened. Incremental updates replace stale records that
+still occupy a normalized path before writing the new file record. If the USN
+Journal was recreated or no longer contains the required history, `pnqi` reports
+that the index must be recreated.

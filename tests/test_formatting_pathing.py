@@ -132,6 +132,28 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(entries["2"].tree_size, 42)
         self.assertEqual(entries["3"].tree_size, 42)
 
+    def test_upsert_replaces_stale_entry_with_same_normalized_path(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            conn = connect(str(Path(temp_dir) / "index.sqlite"))
+            try:
+                create_schema(conn)
+                upsert_entry(conn, Entry("1", "1", "root", "C:\\root", True, 0, 0, 0, 0, 1))
+                upsert_entry(
+                    conn,
+                    Entry("2", "1", "old.bin", "C:\\root\\old.bin", False, 5, 5, 0, 0, 1),
+                )
+                upsert_entry(
+                    conn,
+                    Entry("3", "1", "OLD.bin", "C:\\root\\OLD.bin", False, 7, 7, 0, 0, 2),
+                )
+
+                self.assertIsNone(entry_by_frn(conn, "2"))
+                replacement = entry_by_frn(conn, "3")
+                self.assertIsNotNone(replacement)
+                self.assertEqual(replacement.size, 7)  # type: ignore[union-attr]
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

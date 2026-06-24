@@ -3,5 +3,5 @@
 from __future__ import annotations
 
 __app_name__ = "py-ntfs-quick-index"
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 INDEX_FILENAME = "pnqi.index.sqlite"
