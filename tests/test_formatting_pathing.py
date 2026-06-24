@@ -13,6 +13,8 @@ from pnqi.db import (
     recompute_tree_sizes,
     upsert_entry,
 )
+from pnqi.cli import _pattern_in_drive, _validate_limit
+from pnqi.errors import PnqiError
 from pnqi.formatting import human_percent, human_size
 from pnqi.indexer import _accumulate_entry_tree_sizes
 from pnqi.pathing import normalize_windows_path, sqlite_like_from_star_pattern
@@ -39,6 +41,18 @@ class PathingTests(unittest.TestCase):
             sqlite_like_from_star_pattern("C:/Users/*/Desktop/*"),
             "c:\\\\users\\\\%\\\\desktop\\\\%",
         )
+
+    def test_cli_drive_pattern_resolves_relative_patterns(self) -> None:
+        self.assertEqual(_pattern_in_drive("C:\\", "Users\\*"), "C:\\Users\\*")
+
+    def test_cli_drive_pattern_rejects_other_drives(self) -> None:
+        with self.assertRaises(PnqiError):
+            _pattern_in_drive("C:\\", "D:\\*")
+
+    def test_cli_limit_rejects_negative_values(self) -> None:
+        with self.assertRaises(PnqiError):
+            _validate_limit(-1)
+        _validate_limit(0)
 
 
 class DatabaseTests(unittest.TestCase):

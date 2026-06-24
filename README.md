@@ -47,17 +47,32 @@ Create or replace an index for a folder:
 pnqi index C:\
 ```
 
+List local drives or refresh one existing index:
+
+```powershell
+pnqi drives
+pnqi refresh C:\
+```
+
 Search with `*` wildcards. `*` matches any string, including `\`. Results are
 sorted by displayed size descending.
 
 ```powershell
 pnqi search "C:\Users\*\Desktop\*.pdf"
+pnqi search "Users\*\Desktop\*.pdf" --drive C:\ --details --limit 100
+```
+
+Browse direct children like the GUI folder browser, including each child's share
+of the current folder's recursive size:
+
+```powershell
+pnqi browse C:\Users --limit 100
 ```
 
 Show descendants sorted by recursive size:
 
 ```powershell
-pnqi sizes C:\Users --limit 100
+pnqi sizes C:\Users --limit 100 --details
 ```
 
 Show only direct children:
@@ -67,6 +82,9 @@ pnqi sizes C:\Users --direct
 ```
 
 CLI progress bars use `tqdm`, and `Ctrl+C` cancels cleanly.
+The CLI exposes the same core capabilities as the GUI: drive discovery, drive
+index refresh, index creation, wildcard search with optional drive scoping,
+direct folder browsing with size shares, and recursive size listings.
 
 ## GUI
 
