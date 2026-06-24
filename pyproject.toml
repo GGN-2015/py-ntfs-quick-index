@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "py-ntfs-quick-index"
+version = "0.1.0"
+description = "Fast NTFS indexing and search for Windows amd64."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  { name = "py-ntfs-quick-index contributors" }
+]
+keywords = ["ntfs", "usn", "index", "windows", "sqlite"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Desktop Environment :: File Managers",
+  "Topic :: System :: Filesystems",
+  "Topic :: Utilities",
+]
+dependencies = [
+  "py-admin-launch>=0.1.3",
+  "tqdm>=4.66",
+]
+
+[project.urls]
+Homepage = "https://github.com/"
+
+[project.scripts]
+pnqi = "pnqi.cli:main"
+pnqi-gui = "pnqi.gui:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pnqi"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
