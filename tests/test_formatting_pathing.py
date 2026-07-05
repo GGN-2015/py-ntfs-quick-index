@@ -3,20 +3,25 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from pnqi.db import (
     Entry,
+    SQLITE_INT64_MAX,
+    bulk_insert_entries,
     connect,
     create_schema,
     descendant_frns,
     entry_by_frn,
     recompute_tree_sizes,
+    update_ancestor_sizes,
     upsert_entry,
 )
 from pnqi.cli import _pattern_in_drive, _validate_limit
 from pnqi.errors import PnqiError
-from pnqi.formatting import human_percent, human_size
-from pnqi.indexer import _accumulate_entry_tree_sizes
+from pnqi.formatting import human_mtime, human_percent, human_size
+from pnqi.indexer import _accumulate_entry_tree_sizes, _deduplicate_entries_by_path, _replace_index
 from pnqi.pathing import normalize_windows_path, sqlite_like_from_star_pattern
 
 
@@ -30,6 +35,9 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(human_percent(0, 0), "0%")
         self.assertEqual(human_percent(1, 4), "25%")
         self.assertEqual(human_percent(1, 3), "33.333%")
+
+    def test_human_mtime_handles_out_of_range_values(self) -> None:
+        self.assertEqual(human_mtime(10**30), "Out of range")
 
 
 class PathingTests(unittest.TestCase):
@@ -151,6 +159,35 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(entries["2"].tree_size, 42)
         self.assertEqual(entries["3"].tree_size, 42)
 
+    def test_initial_path_deduplication_keeps_current_file_id_match(self) -> None:
+        entries = {
+            "1": Entry("1", "1", "root", "C:\\root", True, 0, 0, 0, 0, 1),
+            "2": Entry("2", "1", "same.txt", "C:\\root\\same.txt", False, 5, 5, 0, 0, 1),
+            "3": Entry("3", "1", "SAME.txt", "C:\\root\\SAME.txt", False, 7, 7, 0, 0, 2),
+        }
+
+        with patch("pnqi.indexer.get_file_id", return_value=SimpleNamespace(frn=3)):
+            deduped = _deduplicate_entries_by_path(entries, "1")
+
+        self.assertIn("1", deduped)
+        self.assertNotIn("2", deduped)
+        self.assertIn("3", deduped)
+
+    def test_initial_path_deduplication_drops_orphans(self) -> None:
+        entries = {
+            "1": Entry("1", "1", "root", "C:\\root", True, 0, 0, 0, 0, 1),
+            "2": Entry("2", "1", "Folder", "C:\\root\\Folder", True, 0, 0, 0, 0, 1),
+            "3": Entry("3", "1", "folder", "C:\\root\\folder", True, 0, 0, 0, 0, 2),
+            "4": Entry("4", "2", "child.txt", "C:\\root\\Folder\\child.txt", False, 4, 4, 0, 0, 1),
+        }
+
+        with patch("pnqi.indexer.get_file_id", return_value=SimpleNamespace(frn=3)):
+            deduped = _deduplicate_entries_by_path(entries, "1")
+
+        self.assertIn("3", deduped)
+        self.assertNotIn("2", deduped)
+        self.assertNotIn("4", deduped)
+
     def test_upsert_replaces_stale_entry_with_same_normalized_path(self) -> None:
         with TemporaryDirectory() as temp_dir:
             conn = connect(str(Path(temp_dir) / "index.sqlite"))
@@ -172,6 +209,98 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(replacement.size, 7)  # type: ignore[union-attr]
             finally:
                 conn.close()
+
+    def test_bulk_insert_ignores_duplicate_normalized_paths(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            conn = connect(str(Path(temp_dir) / "index.sqlite"))
+            try:
+                create_schema(conn)
+                count = bulk_insert_entries(
+                    conn,
+                    [
+                        Entry("1", "1", "root", "C:\\root", True, 0, 0, 0, 0, 1),
+                        Entry("2", "1", "same.txt", "C:\\root\\same.txt", False, 5, 5, 0, 0, 1),
+                        Entry("3", "1", "SAME.txt", "C:\\root\\SAME.txt", False, 7, 7, 0, 0, 2),
+                    ],
+                )
+
+                self.assertEqual(count, 2)
+                self.assertIsNotNone(entry_by_frn(conn, "2"))
+                self.assertIsNone(entry_by_frn(conn, "3"))
+            finally:
+                conn.close()
+
+    def test_oversized_entry_integers_are_clamped_for_sqlite(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            conn = connect(str(Path(temp_dir) / "index.sqlite"))
+            try:
+                create_schema(conn)
+                upsert_entry(
+                    conn,
+                    Entry(
+                        "1",
+                        "1",
+                        "huge.bin",
+                        "C:\\root\\huge.bin",
+                        False,
+                        2**80,
+                        2**80,
+                        2**80,
+                        2**80,
+                        2**80,
+                    ),
+                )
+
+                entry = entry_by_frn(conn, "1")
+                self.assertIsNotNone(entry)
+                self.assertEqual(entry.size, SQLITE_INT64_MAX)  # type: ignore[union-attr]
+                self.assertEqual(entry.tree_size, SQLITE_INT64_MAX)  # type: ignore[union-attr]
+                self.assertEqual(entry.mtime_ns, SQLITE_INT64_MAX)  # type: ignore[union-attr]
+                self.assertEqual(entry.attributes, SQLITE_INT64_MAX)  # type: ignore[union-attr]
+                self.assertEqual(entry.usn, SQLITE_INT64_MAX)  # type: ignore[union-attr]
+            finally:
+                conn.close()
+
+    def test_ancestor_size_updates_clamp_overflow(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            conn = connect(str(Path(temp_dir) / "index.sqlite"))
+            try:
+                create_schema(conn)
+                upsert_entry(
+                    conn,
+                    Entry("1", "1", "root", "C:\\root", True, 0, SQLITE_INT64_MAX - 1, 0, 0, 1),
+                )
+                upsert_entry(
+                    conn,
+                    Entry("2", "1", "huge.bin", "C:\\root\\huge.bin", False, 10, 10, 0, 0, 1),
+                )
+
+                update_ancestor_sizes(conn, "1", 10)
+
+                root = entry_by_frn(conn, "1")
+                self.assertIsNotNone(root)
+                self.assertEqual(root.tree_size, SQLITE_INT64_MAX)  # type: ignore[union-attr]
+            finally:
+                conn.close()
+
+    def test_replace_index_moves_temp_file_to_final_path(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            temp_path = base / "index.sqlite.tmp"
+            final_path = base / "index.sqlite"
+            temp_path.write_text("new index", encoding="utf-8")
+            final_path.write_text("old index", encoding="utf-8")
+
+            _replace_index(str(temp_path), str(final_path))
+
+            self.assertFalse(temp_path.exists())
+            self.assertEqual(final_path.read_text(encoding="utf-8"), "new index")
+
+    def test_replace_index_reports_missing_temp_file(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            with self.assertRaises(PnqiError):
+                _replace_index(str(base / "missing.sqlite.tmp"), str(base / "index.sqlite"))
 
 
 if __name__ == "__main__":

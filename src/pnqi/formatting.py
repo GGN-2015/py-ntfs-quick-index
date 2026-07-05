@@ -33,4 +33,7 @@ def human_percent(part: int, total: int) -> str:
 def human_mtime(mtime_ns: int) -> str:
     if mtime_ns <= 0:
         return ""
-    return datetime.fromtimestamp(mtime_ns / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return datetime.fromtimestamp(mtime_ns / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        return "Out of range"

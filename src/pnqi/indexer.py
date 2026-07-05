@@ -117,6 +117,71 @@ def _display_name_for_root(root_path: str) -> str:
     return ntpath.basename(root_path) or root_path
 
 
+def _entry_sort_key(entry: Entry) -> tuple[int, int, int, str]:
+    return (int(entry.usn), int(entry.mtime_ns), int(entry.is_dir), entry.frn)
+
+
+def _entry_matches_current_file_id(entry: Entry) -> bool:
+    try:
+        file_id = get_file_id(entry.path)
+    except (OSError, PnqiError):
+        return False
+    return _frn(file_id.frn) == entry.frn
+
+
+def _choose_duplicate_path_entry(candidates: list[Entry], root_frn: str) -> Entry:
+    for entry in candidates:
+        if entry.frn == root_frn:
+            return entry
+    live_matches = [entry for entry in candidates if _entry_matches_current_file_id(entry)]
+    if live_matches:
+        return max(live_matches, key=_entry_sort_key)
+    return max(candidates, key=_entry_sort_key)
+
+
+def _keep_reachable_entries(entries: dict[str, Entry], root_frn: str) -> dict[str, Entry]:
+    reachable: dict[str, Entry] = {}
+    visiting: set[str] = set()
+
+    def is_reachable(frn: str) -> bool:
+        if frn in reachable:
+            return True
+        if frn in visiting:
+            return False
+        entry = entries.get(frn)
+        if entry is None:
+            return False
+        if frn == root_frn:
+            reachable[frn] = entry
+            return True
+        visiting.add(frn)
+        parent = entries.get(entry.parent_frn)
+        if parent is not None and parent.is_dir and is_reachable(parent.frn):
+            reachable[frn] = entry
+            visiting.remove(frn)
+            return True
+        visiting.remove(frn)
+        return False
+
+    for frn in list(entries):
+        is_reachable(frn)
+    return reachable
+
+
+def _deduplicate_entries_by_path(entries: dict[str, Entry], root_frn: str) -> dict[str, Entry]:
+    by_path: dict[str, list[Entry]] = {}
+    for entry in entries.values():
+        by_path.setdefault(normalize_for_match(entry.path), []).append(entry)
+    if all(len(candidates) == 1 for candidates in by_path.values()):
+        return entries
+
+    selected: dict[str, Entry] = {}
+    for candidates in by_path.values():
+        chosen = candidates[0] if len(candidates) == 1 else _choose_duplicate_path_entry(candidates, root_frn)
+        selected[chosen.frn] = chosen
+    return _keep_reachable_entries(selected, root_frn)
+
+
 def _accumulate_entry_tree_sizes(entries: dict[str, Entry], root_frn: str) -> None:
     for entry in sorted(entries.values(), key=lambda item: _path_depth(item.path), reverse=True):
         current = entries[entry.frn]
@@ -196,20 +261,25 @@ def _resolve_index_path_for_existing_path(path: str) -> tuple[str, str, object]:
 
 
 def _replace_index(temp_path: str, final_path: str) -> None:
-    for suffix in ("", "-journal", "-wal", "-shm"):
-        final_artifact = final_path + suffix
-        temp_artifact = temp_path + suffix
-        if suffix and os.path.exists(final_artifact):
-            try:
-                os.remove(final_artifact)
-            except OSError:
-                pass
-        if suffix and os.path.exists(temp_artifact):
-            try:
-                os.remove(temp_artifact)
-            except OSError:
-                pass
-    os.replace(temp_path, final_path)
+    if not os.path.exists(temp_path):
+        raise PnqiError(f"Temporary index file was not created: {temp_path}")
+    try:
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            final_artifact = final_path + suffix
+            temp_artifact = temp_path + suffix
+            if suffix and os.path.exists(final_artifact):
+                try:
+                    os.remove(final_artifact)
+                except OSError:
+                    pass
+            if suffix and os.path.exists(temp_artifact):
+                try:
+                    os.remove(temp_artifact)
+                except OSError:
+                    pass
+        os.replace(temp_path, final_path)
+    except OSError as exc:
+        raise PnqiError(f"Could not write index file {final_path}: {exc}") from exc
 
 
 def _cleanup_temp_index(temp_path: str) -> None:
@@ -346,6 +416,7 @@ def _build_index(
                     ProgressUpdate("stat", considered, len(records), f"Collected {len(entries):,} entries"),
                 )
 
+        entries = _deduplicate_entries_by_path(entries, root_frn)
         _accumulate_entry_tree_sizes(entries, root_frn)
 
         conn = connect(temp_path)
@@ -399,8 +470,9 @@ def build_index(
     *,
     progress: ProgressCallback | None = None,
     token: CancellationToken | None = None,
+    staged: StagedIndex | None = None,
 ) -> str:
-    result = _build_index(root_path, progress=progress, token=token, commit=True)
+    result = _build_index(root_path, progress=progress, token=token, commit=True, staged=staged)
     if not isinstance(result, str):
         raise PnqiError("Internal error: index build returned an uncommitted staged index.")
     return result
@@ -546,6 +618,7 @@ def _scan_filesystem_subtree(
                     ProgressUpdate("partial-scan", scanned, None, f"Scanned {scanned:,} moved/new entries"),
                 )
 
+    entries = _deduplicate_entries_by_path(entries, root_entry.frn)
     _accumulate_entry_tree_sizes(entries, root_entry.frn)
     return list(entries.values())
 

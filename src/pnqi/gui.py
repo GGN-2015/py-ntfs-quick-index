@@ -14,8 +14,8 @@ from .errors import OperationCancelled, PnqiError
 from .formatting import human_mtime, human_percent, human_size
 from .indexer import (
     StagedIndex,
+    build_index,
     browse_children,
-    build_index_staged,
     commit_staged_index,
     discard_staged_index,
     iter_search,
@@ -50,7 +50,7 @@ def _run_process_task(task: str, payload: Any, task_queue: Any, cancel_event: An
     try:
         if task == "index":
             path, staged = payload
-            result = build_index_staged(path, progress=progress, token=token, staged=staged)
+            result = build_index(path, progress=progress, token=token, staged=staged)
         elif task == "search":
             pattern, limit = payload
             chunk: list[Any] = []
@@ -75,7 +75,7 @@ def _run_process_task(task: str, payload: Any, task_queue: Any, cancel_event: An
     except PnqiError as exc:
         task_queue.put(("error", ("pnqi", exc.__class__.__name__, str(exc))))
     except BaseException as exc:
-        task_queue.put(("error", ("unexpected", exc.__class__.__name__, repr(exc))))
+        task_queue.put(("error", ("unexpected", exc.__class__.__name__, str(exc) or repr(exc))))
     else:
         task_queue.put(("done", result))
 
@@ -517,8 +517,8 @@ class PnqiApp(tk.Tk):
         self._task_cancelling = False
         self._streaming_results = False
         try:
-            if staged is not None:
-                result = commit_staged_index(result if isinstance(result, StagedIndex) else staged)
+            if isinstance(result, StagedIndex):
+                result = commit_staged_index(result)
             self._status_var.set("Ready")
             if done is not None:
                 done(result)
@@ -582,7 +582,7 @@ class PnqiApp(tk.Tk):
                 messagebox.showerror("pnqi", message)
         else:
             self._status_var.set("Unexpected error")
-            messagebox.showerror("pnqi", message)
+            messagebox.showerror("pnqi", f"{error_type}: {message}")
 
     def _close(self) -> None:
         if self._task_process is not None and self._task_process.is_alive():

@@ -15,6 +15,8 @@ from .pathing import normalize_for_match, normalize_windows_path
 from .progress import CancellationToken, ProgressCallback, ProgressUpdate, report
 
 SCHEMA_VERSION = "1"
+SQLITE_INT64_MIN = -(2**63)
+SQLITE_INT64_MAX = 2**63 - 1
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,40 @@ class Entry:
     @property
     def display_size(self) -> str:
         return human_size(self.tree_size if self.is_dir else self.size)
+
+
+def clamp_sqlite_integer(value: int) -> int:
+    value = int(value)
+    if value < SQLITE_INT64_MIN:
+        return SQLITE_INT64_MIN
+    if value > SQLITE_INT64_MAX:
+        return SQLITE_INT64_MAX
+    return value
+
+
+def clamp_sqlite_nonnegative_integer(value: int) -> int:
+    value = int(value)
+    if value <= 0:
+        return 0
+    if value > SQLITE_INT64_MAX:
+        return SQLITE_INT64_MAX
+    return value
+
+
+def _entry_sql_values(entry: Entry) -> tuple[object, ...]:
+    return (
+        entry.frn,
+        entry.parent_frn,
+        entry.name,
+        entry.path,
+        normalize_for_match(entry.path),
+        int(entry.is_dir),
+        clamp_sqlite_nonnegative_integer(entry.size),
+        clamp_sqlite_nonnegative_integer(entry.tree_size),
+        clamp_sqlite_integer(entry.mtime_ns),
+        clamp_sqlite_integer(entry.attributes),
+        clamp_sqlite_integer(entry.usn),
+    )
 
 
 def connect(path: str, *, readonly: bool = False) -> sqlite3.Connection:
@@ -176,19 +212,7 @@ def upsert_entry(conn: sqlite3.Connection, entry: Entry) -> None:
             attributes = excluded.attributes,
             usn = excluded.usn
         """,
-        (
-            entry.frn,
-            entry.parent_frn,
-            entry.name,
-            entry.path,
-            path_norm,
-            int(entry.is_dir),
-            entry.size,
-            entry.tree_size,
-            entry.mtime_ns,
-            entry.attributes,
-            entry.usn,
-        ),
+        _entry_sql_values(entry),
     )
 
 
@@ -201,7 +225,7 @@ def bulk_insert_entries(
     token: CancellationToken | None = None,
 ) -> int:
     sql = """
-        INSERT INTO entries (
+        INSERT OR IGNORE INTO entries (
             frn, parent_frn, name, path, path_norm, is_dir, size, tree_size,
             mtime_ns, attributes, usn
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -211,29 +235,15 @@ def bulk_insert_entries(
     for entry in entries:
         if token is not None:
             token.check()
-        chunk.append(
-            (
-                entry.frn,
-                entry.parent_frn,
-                entry.name,
-                entry.path,
-                normalize_for_match(entry.path),
-                int(entry.is_dir),
-                entry.size,
-                entry.tree_size,
-                entry.mtime_ns,
-                entry.attributes,
-                entry.usn,
-            )
-        )
+        chunk.append(_entry_sql_values(entry))
         if len(chunk) >= chunk_size:
-            conn.executemany(sql, chunk)
-            count += len(chunk)
+            cursor = conn.executemany(sql, chunk)
+            count += cursor.rowcount if cursor.rowcount >= 0 else len(chunk)
             report(progress, ProgressUpdate("write", count, None, f"Indexed {count:,} entries"))
             chunk.clear()
     if chunk:
-        conn.executemany(sql, chunk)
-        count += len(chunk)
+        cursor = conn.executemany(sql, chunk)
+        count += cursor.rowcount if cursor.rowcount >= 0 else len(chunk)
         report(progress, ProgressUpdate("write", count, None, f"Indexed {count:,} entries"))
     return count
 
@@ -245,10 +255,14 @@ def update_ancestor_sizes(conn: sqlite3.Connection, parent_frn: str, delta: int)
     seen: set[str] = set()
     while current and current not in seen:
         seen.add(current)
-        row = conn.execute("SELECT parent_frn FROM entries WHERE frn = ?", (current,)).fetchone()
+        row = conn.execute(
+            "SELECT parent_frn, tree_size FROM entries WHERE frn = ?",
+            (current,),
+        ).fetchone()
         if row is None:
             break
-        conn.execute("UPDATE entries SET tree_size = tree_size + ? WHERE frn = ?", (delta, current))
+        tree_size = clamp_sqlite_nonnegative_integer(int(row["tree_size"]) + int(delta))
+        conn.execute("UPDATE entries SET tree_size = ? WHERE frn = ?", (tree_size, current))
         next_parent = row["parent_frn"]
         if not next_parent or next_parent == current:
             break
@@ -292,7 +306,7 @@ def recompute_tree_sizes(
 
     conn.executemany(
         "UPDATE entries SET tree_size = ? WHERE frn = ?",
-        [(tree_size, frn) for frn, tree_size in sizes.items()],
+        [(clamp_sqlite_nonnegative_integer(tree_size), frn) for frn, tree_size in sizes.items()],
     )
     report(
         progress,
