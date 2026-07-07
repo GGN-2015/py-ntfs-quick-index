@@ -30,6 +30,7 @@ from pnqi.indexer import (
     _deduplicate_entries_by_path,
     _recover_index_from_filesystem,
     _replace_index,
+    _scan_filesystem_subtree,
 )
 from pnqi.lock import acquire_index_lock, lock_paths
 from pnqi.pathing import normalize_windows_path, sqlite_like_from_star_pattern
@@ -449,6 +450,37 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(metadata["root_frn"], "1")
             finally:
                 conn.close()
+
+    def test_filesystem_scan_preserves_cached_entry_when_file_id_is_locked(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = normalize_windows_path(temp_dir)
+            locked_path = normalize_windows_path(str(Path(temp_dir) / "locked.txt"))
+            Path(locked_path).write_text("locked", encoding="utf-8")
+            cached = Entry("locked-frn", "root-frn", "locked.txt", locked_path, False, 6, 6, 123, 0, 10)
+
+            def fake_get_file_id(path: str) -> SimpleNamespace:
+                normalized = normalize_windows_path(path)
+                if normalized == root:
+                    return SimpleNamespace(frn="root-frn", volume_serial=123, attributes=FILE_ATTRIBUTE_DIRECTORY)
+                if normalized == locked_path:
+                    raise PnqiError("CreateFileW failed: Win32 error 32: sharing violation")
+                return SimpleNamespace(frn="other-frn", volume_serial=123, attributes=0)
+
+            with patch("pnqi.indexer.get_file_id", side_effect=fake_get_file_id):
+                entries = _scan_filesystem_subtree(
+                    root,
+                    parent_frn="parent-frn",
+                    volume_root=root,
+                    usn=50,
+                    progress=None,
+                    token=CancellationToken(),
+                    existing_entries_by_path={normalize_windows_path(locked_path).casefold(): cached},
+                )
+
+            by_path = {entry.path: entry for entry in entries}
+            self.assertIn(locked_path, by_path)
+            self.assertEqual(by_path[locked_path].frn, "locked-frn")
+            self.assertEqual(by_path[locked_path].usn, 50)
 
     def test_portable_filesystem_build_writes_sqlite_index(self) -> None:
         with TemporaryDirectory() as temp_dir:

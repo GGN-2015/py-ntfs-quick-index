@@ -687,6 +687,7 @@ def _recover_index_from_filesystem(
         journal_id = 0
     root_frn = _frn(root_id.frn)
     parent_frn = _parent_frn_for_existing_path(root_path, root_frn)
+    existing_entries_by_path = _existing_entries_by_path(conn)
     try:
         entries = _scan_filesystem_subtree(
             root_path,
@@ -695,6 +696,7 @@ def _recover_index_from_filesystem(
             usn=high_usn,
             progress=progress,
             token=token,
+            existing_entries_by_path=existing_entries_by_path,
         )
     except OSError as exc:
         raise IndexInvalidError("The indexed root is no longer accessible; create a new index.") from exc
@@ -722,6 +724,13 @@ def _recover_index_from_filesystem(
         raise
     report(progress, ProgressUpdate("recover", count, count, f"Reconciled {count:,} entries"))
     return high_usn
+
+
+def _existing_entries_by_path(conn) -> dict[str, Entry]:
+    return {
+        normalize_for_match(entry.path): entry
+        for entry in (row_to_entry(row) for row in conn.execute("SELECT * FROM entries"))
+    }
 
 
 def _recover_and_replay_index(
@@ -773,6 +782,39 @@ def _entry_from_record_path(
     return path, parent, entry
 
 
+def _entry_for_recovery_preserve(entry: Entry, *, usn: int) -> Entry:
+    return Entry(
+        frn=entry.frn,
+        parent_frn=entry.parent_frn,
+        name=entry.name,
+        path=entry.path,
+        is_dir=entry.is_dir,
+        size=entry.size,
+        tree_size=0 if entry.is_dir else entry.size,
+        mtime_ns=entry.mtime_ns,
+        attributes=entry.attributes,
+        usn=usn,
+    )
+
+
+def _preserve_existing_entries_for_path(
+    entries: dict[str, Entry],
+    existing_entries_by_path: dict[str, Entry] | None,
+    inaccessible_path: str,
+    *,
+    usn: int,
+) -> int:
+    if not existing_entries_by_path:
+        return 0
+    preserved = 0
+    for old_entry in existing_entries_by_path.values():
+        if not _is_under(old_entry.path, inaccessible_path):
+            continue
+        entries.setdefault(old_entry.frn, _entry_for_recovery_preserve(old_entry, usn=usn))
+        preserved += 1
+    return preserved
+
+
 def _scan_filesystem_subtree(
     path: str,
     *,
@@ -781,6 +823,7 @@ def _scan_filesystem_subtree(
     usn: int,
     progress: ProgressCallback | None,
     token: CancellationToken,
+    existing_entries_by_path: dict[str, Entry] | None = None,
 ) -> list[Entry]:
     root_id = get_file_id(path)
     root_stat = os.stat(path, follow_symlinks=False)
@@ -800,6 +843,8 @@ def _scan_filesystem_subtree(
     entries: dict[str, Entry] = {root_entry.frn: root_entry}
     stack: list[Entry] = [root_entry]
     scanned = 0
+    inaccessible = 0
+    preserved = 0
     while stack:
         token.check()
         parent = stack.pop()
@@ -817,10 +862,17 @@ def _scan_filesystem_subtree(
             try:
                 child_id = get_file_id(child_path)
                 child_stat = child.stat(follow_symlinks=False)
-            except OSError:
+            except (OSError, PnqiError):
+                inaccessible += 1
+                preserved += _preserve_existing_entries_for_path(
+                    entries,
+                    existing_entries_by_path,
+                    child_path,
+                    usn=usn,
+                )
                 continue
             attributes = int(getattr(child_stat, "st_file_attributes", child_id.attributes))
-            child_is_dir = child.is_dir(follow_symlinks=False) or bool(attributes & FILE_ATTRIBUTE_DIRECTORY)
+            child_is_dir = _is_dir(attributes)
             size = 0 if child_is_dir else int(child_stat.st_size)
             entry = Entry(
                 frn=_frn(child_id.frn),
@@ -846,6 +898,11 @@ def _scan_filesystem_subtree(
 
     entries = _deduplicate_entries_by_path(entries, root_entry.frn)
     _accumulate_entry_tree_sizes(entries, root_entry.frn)
+    if inaccessible:
+        message = f"Skipped {inaccessible:,} inaccessible filesystem entries"
+        if preserved:
+            message += f"; preserved {preserved:,} cached index entries"
+        report(progress, ProgressUpdate("recover", scanned, None, message))
     return list(entries.values())
 
 
