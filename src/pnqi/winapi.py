@@ -4,7 +4,7 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 
-from .errors import NotNtfsError, PnqiError
+from .errors import IndexInvalidError, NotNtfsError, PnqiError
 from .pathing import normalize_windows_path
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -20,6 +20,7 @@ FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 ERROR_HANDLE_EOF = 38
 ERROR_JOURNAL_NOT_ACTIVE = 1179
+ERROR_JOURNAL_ENTRY_DELETED = 1181
 
 FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 
@@ -384,6 +385,10 @@ def read_usn_changes(
     while data.StartUsn < stop_usn:
         ok, returned, error = _device_io_control(handle, FSCTL_READ_USN_JOURNAL, data, buffer)
         if not ok:
+            if error in {ERROR_JOURNAL_NOT_ACTIVE, ERROR_JOURNAL_ENTRY_DELETED}:
+                raise IndexInvalidError(
+                    "The NTFS USN Journal no longer contains all changes; create a new index."
+                )
             raise PnqiError(f"FSCTL_READ_USN_JOURNAL failed: Win32 error {error}: {ctypes.FormatError(error)}")
         if returned <= 8:
             break

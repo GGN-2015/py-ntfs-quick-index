@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from pnqi.db import (
     Entry,
@@ -19,10 +19,16 @@ from pnqi.db import (
     upsert_entry,
 )
 from pnqi.cli import _pattern_in_drive, _validate_limit
-from pnqi.errors import PnqiError
+from pnqi.errors import IndexInvalidError, PnqiError
 from pnqi.formatting import human_mtime, human_percent, human_size
-from pnqi.indexer import _accumulate_entry_tree_sizes, _deduplicate_entries_by_path, _replace_index
+from pnqi.indexer import (
+    _accumulate_entry_tree_sizes,
+    _deduplicate_entries_by_path,
+    _recover_index_from_filesystem,
+    _replace_index,
+)
 from pnqi.pathing import normalize_windows_path, sqlite_like_from_star_pattern
+from pnqi.winapi import ERROR_JOURNAL_ENTRY_DELETED, FILE_ATTRIBUTE_DIRECTORY, read_usn_changes
 
 
 class FormattingTests(unittest.TestCase):
@@ -301,6 +307,69 @@ class DatabaseTests(unittest.TestCase):
             base = Path(temp_dir)
             with self.assertRaises(PnqiError):
                 _replace_index(str(base / "missing.sqlite.tmp"), str(base / "index.sqlite"))
+
+    def test_deleted_usn_journal_entry_requires_reindex(self) -> None:
+        handle = SimpleNamespace(value=1)
+        with patch(
+            "pnqi.winapi._device_io_control",
+            return_value=(False, 0, ERROR_JOURNAL_ENTRY_DELETED),
+        ):
+            with self.assertRaisesRegex(IndexInvalidError, "create a new index"):
+                list(read_usn_changes(handle, journal_id=1, start_usn=1, stop_usn=2))
+
+    def test_recover_index_from_filesystem_replaces_stale_entries(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = normalize_windows_path(temp_dir)
+            file_path = normalize_windows_path(str(Path(temp_dir) / "current.txt"))
+            Path(file_path).write_text("hello", encoding="utf-8")
+            drive = root[:2] + "\\"
+            volume = SimpleNamespace(root=drive, serial=123, filesystem="NTFS")
+            conn = connect(str(Path(temp_dir) / "index.sqlite"))
+            try:
+                create_schema(conn)
+                upsert_entry(conn, Entry("99", "99", "stale.txt", root + "\\stale.txt", False, 1, 1, 0, 0, 1))
+                conn.commit()
+                meta = {
+                    "root_path": root,
+                    "root_frn": "99",
+                }
+
+                def fake_get_file_id(path: str) -> SimpleNamespace:
+                    normalized = normalize_windows_path(path)
+                    if normalized == root:
+                        return SimpleNamespace(frn=1, volume_serial=123, attributes=FILE_ATTRIBUTE_DIRECTORY)
+                    if normalized == file_path:
+                        return SimpleNamespace(frn=2, volume_serial=123, attributes=0)
+                    return SimpleNamespace(frn=10, volume_serial=123, attributes=FILE_ATTRIBUTE_DIRECTORY)
+
+                journal = SimpleNamespace(next_usn=50, journal_id=77)
+                context = MagicMock()
+                context.__enter__.return_value = SimpleNamespace(value=1)
+                context.__exit__.return_value = None
+                with (
+                    patch("pnqi.indexer.get_file_id", side_effect=fake_get_file_id),
+                    patch("pnqi.indexer.open_volume", return_value=context),
+                    patch("pnqi.indexer.query_usn_journal", return_value=journal),
+                ):
+                    high_usn = _recover_index_from_filesystem(
+                        conn,
+                        meta,
+                        volume=volume,
+                        progress=None,
+                        token=SimpleNamespace(check=lambda: None),
+                    )
+
+                self.assertEqual(high_usn, 50)
+                self.assertIsNone(entry_by_frn(conn, "99"))
+                current = entry_by_frn(conn, "2")
+                self.assertIsNotNone(current)
+                self.assertEqual(current.path, file_path)  # type: ignore[union-attr]
+                metadata = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM metadata")}
+                self.assertEqual(metadata["indexed_usn"], "50")
+                self.assertEqual(metadata["journal_id"], "77")
+                self.assertEqual(metadata["root_frn"], "1")
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":

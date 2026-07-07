@@ -260,6 +260,21 @@ def _resolve_index_path_for_existing_path(path: str) -> tuple[str, str, object]:
     return root_path, index_path_for_volume(volume.root), volume
 
 
+def _parent_frn_for_existing_path(path: str, fallback_frn: str) -> str:
+    normalized = normalize_windows_path(path)
+    if normalized.endswith("\\") and len(normalized) == 3:
+        return fallback_frn
+    parent = ntpath.dirname(normalized.rstrip("\\"))
+    if not parent:
+        return fallback_frn
+    if len(parent) == 2:
+        parent += "\\"
+    try:
+        return _frn(get_file_id(parent).frn)
+    except (OSError, PnqiError):
+        return fallback_frn
+
+
 def _replace_index(temp_path: str, final_path: str) -> None:
     if not os.path.exists(temp_path):
         raise PnqiError(f"Temporary index file was not created: {temp_path}")
@@ -524,6 +539,84 @@ def _collect_changes(
     return changes
 
 
+def _recover_index_from_filesystem(
+    conn: sqlite3.Connection,
+    meta: dict[str, str],
+    *,
+    volume,
+    progress: ProgressCallback | None,
+    token: CancellationToken,
+) -> int:
+    root_path = normalize_windows_path(meta["root_path"])
+    report(progress, ProgressUpdate("recover", 0, None, "Reconciling index from the filesystem"))
+    try:
+        root_id = get_file_id(root_path)
+    except (OSError, PnqiError) as exc:
+        raise IndexInvalidError("The indexed root is no longer accessible; create a new index.") from exc
+    if root_id.volume_serial != int(volume.serial):
+        raise IndexInvalidError("The indexed root is no longer on the indexed volume; create a new index.")
+
+    with open_volume(volume) as handle:
+        journal = query_usn_journal(handle)
+    high_usn = journal.next_usn
+    root_frn = _frn(root_id.frn)
+    parent_frn = _parent_frn_for_existing_path(root_path, root_frn)
+    try:
+        entries = _scan_filesystem_subtree(
+            root_path,
+            parent_frn=parent_frn,
+            volume_root=volume.root,
+            usn=high_usn,
+            progress=progress,
+            token=token,
+        )
+    except OSError as exc:
+        raise IndexInvalidError("The indexed root is no longer accessible; create a new index.") from exc
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM entries")
+        count = bulk_insert_entries(conn, entries, progress=progress, token=token)
+        set_metadata(
+            conn,
+            volume_root=volume.root,
+            volume_serial=volume.serial,
+            filesystem=volume.filesystem,
+            root_path=root_path,
+            root_frn=root_frn,
+            journal_id=journal.journal_id,
+            tree_size_version=TREE_SIZE_VERSION,
+            entry_count=count,
+        )
+        stamp_finished_metadata(conn, high_usn)
+        token.check()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    report(progress, ProgressUpdate("recover", count, count, f"Reconciled {count:,} entries"))
+    return high_usn
+
+
+def _recover_and_replay_index(
+    path: str,
+    conn: sqlite3.Connection,
+    meta: dict[str, str],
+    *,
+    volume,
+    progress: ProgressCallback | None,
+    token: CancellationToken,
+    recovery_attempts: int,
+) -> str:
+    index_path = index_path_for_volume(volume.root)
+    _recover_index_from_filesystem(conn, meta, volume=volume, progress=progress, token=token)
+    if recovery_attempts >= 2:
+        report(progress, ProgressUpdate("done", 0, 0, "Index was reconciled from the filesystem"))
+        return index_path
+    conn.close()
+    return update_index(path, progress=progress, token=token, _recovery_attempts=recovery_attempts + 1)
+
+
 def _entry_from_record_path(
     conn: sqlite3.Connection,
     record: UsnRecord,
@@ -748,6 +841,7 @@ def update_index(
     *,
     progress: ProgressCallback | None = None,
     token: CancellationToken | None = None,
+    _recovery_attempts: int = 0,
 ) -> str:
     validate_supported_platform()
     require_admin()
@@ -770,9 +864,25 @@ def update_index(
             journal = query_usn_journal(handle)
             indexed_usn = int(meta["indexed_usn"])
             if str(journal.journal_id) != meta["journal_id"]:
-                raise IndexInvalidError("The NTFS USN Journal was recreated; create a new index.")
+                return _recover_and_replay_index(
+                    absolute,
+                    conn,
+                    meta,
+                    volume=volume,
+                    progress=progress,
+                    token=token,
+                    recovery_attempts=_recovery_attempts,
+                )
             if indexed_usn < journal.lowest_valid_usn:
-                raise IndexInvalidError("The NTFS USN Journal no longer contains all changes; create a new index.")
+                return _recover_and_replay_index(
+                    absolute,
+                    conn,
+                    meta,
+                    volume=volume,
+                    progress=progress,
+                    token=token,
+                    recovery_attempts=_recovery_attempts,
+                )
             if indexed_usn >= journal.next_usn:
                 if meta.get("tree_size_version") != TREE_SIZE_VERSION:
                     conn.execute("BEGIN IMMEDIATE")
@@ -781,14 +891,25 @@ def update_index(
                     conn.commit()
                 report(progress, ProgressUpdate("done", 0, 0, "Index is already fresh"))
                 return index_path
-            changes = _collect_changes(
-                handle,
-                journal_id=journal.journal_id,
-                start_usn=indexed_usn,
-                stop_usn=journal.next_usn,
-                progress=progress,
-                token=token,
-            )
+            try:
+                changes = _collect_changes(
+                    handle,
+                    journal_id=journal.journal_id,
+                    start_usn=indexed_usn,
+                    stop_usn=journal.next_usn,
+                    progress=progress,
+                    token=token,
+                )
+            except IndexInvalidError:
+                return _recover_and_replay_index(
+                    absolute,
+                    conn,
+                    meta,
+                    volume=volume,
+                    progress=progress,
+                    token=token,
+                    recovery_attempts=_recovery_attempts,
+                )
 
         if not changes:
             conn.execute("BEGIN IMMEDIATE")
