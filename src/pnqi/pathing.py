@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import ntpath
 import os
+import posixpath
 from pathlib import Path
 
 from . import INDEX_FILENAME
+from .platform import is_windows
 
 
 def normalize_windows_path(path: str) -> str:
+    if not is_windows():
+        normed = posixpath.normpath(path.replace("\\", "/"))
+        if normed == "/":
+            return normed
+        return normed.rstrip("/")
     path = path.replace("/", "\\")
     normed = ntpath.normpath(path)
     drive, tail = ntpath.splitdrive(normed)
@@ -25,6 +32,11 @@ def absolute_existing_path(path: str) -> str:
 
 
 def absolute_pattern(pattern: str) -> str:
+    if not is_windows():
+        pattern = pattern.replace("\\", "/")
+        if posixpath.isabs(pattern):
+            return normalize_windows_path(pattern)
+        return normalize_windows_path(os.path.abspath(pattern))
     pattern = pattern.replace("/", "\\")
     drive, _ = ntpath.splitdrive(pattern)
     if drive:
@@ -33,6 +45,10 @@ def absolute_pattern(pattern: str) -> str:
 
 
 def join_windows_path(parent: str, name: str) -> str:
+    if not is_windows():
+        if parent == "/":
+            return "/" + name
+        return parent.rstrip("/") + "/" + name
     if parent.endswith("\\"):
         return parent + name
     return parent + "\\" + name
@@ -61,6 +77,11 @@ def temporary_index_path(final_path: str, pid: int | None = None) -> str:
 
 
 def is_index_artifact(path: str, volume_root: str) -> bool:
+    if not is_windows():
+        parent = normalize_for_match(posixpath.dirname(path))
+        root = normalize_for_match(volume_root).rstrip("/")
+        name = posixpath.basename(path).casefold()
+        return parent == root and name.startswith(INDEX_FILENAME.casefold())
     parent = normalize_for_match(ntpath.dirname(path))
     root = normalize_for_match(volume_root).rstrip("\\")
     name = ntpath.basename(path).casefold()

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-ntfs-quick-index"
-version = "0.1.10"
-description = "Fast NTFS indexing and search for Windows amd64."
+version = "0.1.11"
+description = "Fast filesystem indexing and search with a Windows NTFS fast path."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -19,7 +19,9 @@ classifiers = [
   "Environment :: Win32 (MS Windows)",
   "Intended Audience :: End Users/Desktop",
   "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
   "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Topic :: Desktop Environment :: File Managers",

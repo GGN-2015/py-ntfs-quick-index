@@ -1,20 +1,28 @@
 # py-ntfs-quick-index
 
-Fast Windows NTFS indexing and search for amd64 machines.
+Fast filesystem indexing and search, with a Windows NTFS fast path.
 
-`pnqi` uses NTFS MFT enumeration for initial indexing and the NTFS USN Journal
-for incremental refreshes. Indexes are stored as SQLite files named
-`pnqi.index.sqlite` in the volume root, for example `C:\pnqi.index.sqlite`.
+On Windows, `pnqi` uses NTFS MFT enumeration for initial indexing and the NTFS
+USN Journal for incremental refreshes. On Linux and macOS, including mounted
+NTFS volumes, `pnqi` uses a portable filesystem scan fallback. Portable refresh
+reconciles the SQLite index from the current filesystem state instead of using
+USN Journal deltas.
+
+Indexes are stored as SQLite files named `pnqi.index.sqlite` in the volume or
+mount root, for example `C:\pnqi.index.sqlite` or
+`/mnt/external/pnqi.index.sqlite`.
 
 ## Requirements
 
-- Windows only
-- amd64 / x86_64 CPU only
-- Administrator privileges
-- NTFS volumes only
+- Windows, Linux, or macOS
+- Windows fast mode requires amd64 / x86_64, administrator privileges, and NTFS
+  volumes
+- Linux/macOS portable mode works with readable mounted filesystems, including
+  mounted NTFS volumes, and requires write access to the mount root for the
+  SQLite index
 - Python 3.10+
 
-The program elevates only at startup through
+On Windows, the program elevates only at startup through
 [`py-admin-launch`](https://pypi.org/project/py-admin-launch/). Internal library
 calls require the already-elevated process and do not trigger additional UAC
 prompts.
@@ -119,10 +127,14 @@ It does not change the Poetry package configuration or runtime dependencies.
 
 ## Incremental Updates
 
-When a GUI drive is selected, and before searches or browsing, `pnqi` checks the
-drive's existing `pnqi.index.sqlite` file and replays USN Journal changes into
-SQLite. Folder sizes are maintained as recursive sums of all descendant files;
-older indexes are recalculated once when opened. Incremental updates replace
-stale records that still occupy a normalized path before writing the new file
-record. If the USN Journal was recreated or no longer contains the required
-history, `pnqi` reports that the index must be recreated.
+When a GUI drive is selected, and before searches or browsing on Windows, `pnqi`
+checks the drive's existing `pnqi.index.sqlite` file and replays USN Journal
+changes into SQLite. Folder sizes are maintained as recursive sums of all
+descendant files; older indexes are recalculated once when opened. Incremental
+updates replace stale records that still occupy a normalized path before writing
+the new file record. If the USN Journal was recreated or no longer contains the
+required history, `pnqi` reconciles the existing SQLite index from the current
+filesystem and then resumes incremental updates.
+
+On Linux and macOS, refresh always reconciles from the current filesystem state
+because the Windows NTFS USN Journal API is not available.

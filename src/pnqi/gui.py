@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing
 import ntpath
+import os
 import queue
 import sys
 import time
@@ -22,7 +23,8 @@ from .indexer import (
     list_sizes,
     planned_staged_index,
 )
-from .pathing import normalize_for_match, normalize_windows_path
+from .pathing import join_windows_path, normalize_for_match, normalize_windows_path
+from .platform import is_windows
 from .progress import CancellationToken, ProgressUpdate
 from .winapi import logical_drive_roots
 
@@ -126,6 +128,7 @@ class PnqiApp(tk.Tk):
         self._task_payload: Any = None
         self._task_staged_index: StagedIndex | None = None
         self._task_cancelling = False
+        self._exit_after_cancel = False
         self._streaming_results = False
         self._streamed_result_count = 0
         self._locked_widgets: list[tk.Widget] = []
@@ -293,7 +296,7 @@ class PnqiApp(tk.Tk):
         self._volume_root = root
         self.drive_var.set(root)
         self._current_browse_path.set(root)
-        self.pattern_var.set(root + "*")
+        self.pattern_var.set(join_windows_path(root, "*"))
         self.tree.delete(*self.tree.get_children())
         self.results.delete(*self.results.get_children())
         self._browse(root)
@@ -359,7 +362,9 @@ class PnqiApp(tk.Tk):
         if self._volume_root is not None and normalize_for_match(current) == normalize_for_match(self._volume_root):
             return
         parent = current.rstrip("\\/")
-        if len(parent) <= 2:
+        if not is_windows():
+            parent = os.path.dirname(parent) or "/"
+        elif len(parent) <= 2:
             parent = parent + "\\"
         else:
             parent = parent.rsplit("\\", 1)[0]
@@ -390,6 +395,15 @@ class PnqiApp(tk.Tk):
     def _pattern_in_selected_drive(self, pattern: str) -> str:
         if self._volume_root is None:
             raise PnqiError("Choose a drive first.")
+        if not is_windows():
+            pattern = pattern.replace("\\", "/")
+            if os.path.isabs(pattern):
+                resolved = normalize_windows_path(pattern)
+            else:
+                resolved = normalize_windows_path(join_windows_path(self._volume_root, pattern.lstrip("/")))
+            if not self._is_inside_selected_drive(resolved):
+                raise PnqiError("Search patterns must stay inside the selected drive.")
+            return resolved
         pattern = pattern.replace("/", "\\")
         drive, _tail = ntpath.splitdrive(pattern)
         if drive:
@@ -403,8 +417,9 @@ class PnqiApp(tk.Tk):
     def _is_inside_selected_drive(self, path: str) -> bool:
         if self._volume_root is None:
             return False
-        root = normalize_for_match(self._volume_root).rstrip("\\") + "\\"
-        candidate = normalize_for_match(path).rstrip("\\") + "\\"
+        separator = "\\" if is_windows() else "/"
+        root = normalize_for_match(self._volume_root).rstrip(separator) + separator
+        candidate = normalize_for_match(path).rstrip(separator) + separator
         return candidate.startswith(root)
 
     def _run_task(
@@ -427,6 +442,7 @@ class PnqiApp(tk.Tk):
         self._task_payload = payload
         self._task_staged_index = staged_index
         self._task_cancelling = False
+        self._exit_after_cancel = False
         self._streaming_results = stream_results
         self._streamed_result_count = 0
         self._set_locked(True)
@@ -515,6 +531,7 @@ class PnqiApp(tk.Tk):
         self._task_payload = None
         self._task_staged_index = None
         self._task_cancelling = False
+        self._exit_after_cancel = False
         self._streaming_results = False
         try:
             if isinstance(result, StagedIndex):
@@ -541,10 +558,14 @@ class PnqiApp(tk.Tk):
         self._task_staged_index = None
         self._task_cancelling = False
         self._streaming_results = False
+        exit_after_cancel = self._exit_after_cancel
+        self._exit_after_cancel = False
         self._clear_task_queue()
         self._set_locked(False)
         self._set_indeterminate(False)
         self._status_var.set("Cancelled")
+        if exit_after_cancel:
+            self.destroy()
 
     def _finish_error(self, payload: Any) -> None:
         self._join_task_process()
@@ -559,6 +580,7 @@ class PnqiApp(tk.Tk):
         self._task_payload = None
         self._task_staged_index = None
         self._task_cancelling = False
+        self._exit_after_cancel = False
         self._streaming_results = False
         error_kind = payload[0] if len(payload) >= 1 else "unexpected"
         error_type = payload[1] if len(payload) >= 3 else "PnqiError"
@@ -596,6 +618,10 @@ class PnqiApp(tk.Tk):
 
     def _handle_progress(self, update: ProgressUpdate) -> None:
         self._status_var.set(update.message or update.stage)
+        if update.stage == "lock":
+            self._exit_after_cancel = True
+        else:
+            self._exit_after_cancel = False
         if update.total and update.current is not None:
             self._set_indeterminate(False)
             self._progress_var.set(min(100.0, max(0.0, update.current / update.total * 100.0)))

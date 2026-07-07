@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ntpath
+import os
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -12,7 +13,8 @@ from .admin import ELEVATED_CHILD_FLAG, ensure_startup_admin, without_elevated_f
 from .errors import OperationCancelled, PnqiError
 from .formatting import human_mtime, human_percent, human_size
 from .indexer import browse_children, build_index, list_sizes, refresh_known_indexes, search, update_index
-from .pathing import normalize_for_match, normalize_windows_path
+from .pathing import join_windows_path, normalize_for_match, normalize_windows_path
+from .platform import is_windows
 from .progress import CancellationToken, ProgressUpdate
 from .winapi import logical_drive_roots
 
@@ -67,7 +69,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pnqi",
-        description="Fast NTFS index and search tool for Windows amd64.",
+        description="Fast filesystem index and search tool.",
     )
     parser.add_argument("--gui", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(ELEVATED_CHILD_FLAG, nargs="?", help=argparse.SUPPRESS)
@@ -84,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_parser.add_argument("path", help="indexed path or drive to refresh")
 
     search_parser = subparsers.add_parser("search", help="search indexed files by a * wildcard path")
-    search_parser.add_argument("pattern", help="path pattern; * matches any string including backslashes")
+    search_parser.add_argument("pattern", help="path pattern; * matches any string including path separators")
     search_parser.add_argument("--limit", type=int, default=0, help="maximum number of rows to print")
     search_parser.add_argument(
         "--drive",
@@ -157,13 +159,23 @@ def _print_browse(root: Any, entries: list[Any], *, limit: int) -> None:
 
 
 def _is_inside_root(root: str, path: str) -> bool:
-    root_norm = normalize_for_match(root).rstrip("\\") + "\\"
-    candidate = normalize_for_match(path).rstrip("\\") + "\\"
+    separator = "\\" if is_windows() else "/"
+    root_norm = normalize_for_match(root).rstrip(separator) + separator
+    candidate = normalize_for_match(path).rstrip(separator) + separator
     return candidate.startswith(root_norm)
 
 
 def _pattern_in_drive(drive: str, pattern: str) -> str:
     root = normalize_windows_path(drive)
+    if not is_windows():
+        pattern = pattern.replace("\\", "/")
+        if os.path.isabs(pattern):
+            resolved = normalize_windows_path(pattern)
+        else:
+            resolved = normalize_windows_path(join_windows_path(root, pattern.lstrip("/")))
+        if not _is_inside_root(root, resolved):
+            raise PnqiError("Search patterns must stay inside the selected drive.")
+        return resolved
     pattern = pattern.replace("/", "\\")
     drive_name, _tail = ntpath.splitdrive(pattern)
     if drive_name:
@@ -209,10 +221,11 @@ def run(argv: list[str] | None = None) -> int:
                 ntfs_drives = []
                 for drive in drives:
                     try:
-                        get_volume_info(drive)
+                        volume = get_volume_info(drive)
                     except PnqiError:
                         continue
-                    ntfs_drives.append(drive)
+                    if "NTFS" in volume.filesystem.upper():
+                        ntfs_drives.append(drive)
                 drives = ntfs_drives
             for drive in drives:
                 print(drive)

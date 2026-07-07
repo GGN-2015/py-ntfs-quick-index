@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -23,11 +25,14 @@ from pnqi.errors import IndexInvalidError, PnqiError
 from pnqi.formatting import human_mtime, human_percent, human_size
 from pnqi.indexer import (
     _accumulate_entry_tree_sizes,
+    _build_index_from_filesystem,
     _deduplicate_entries_by_path,
     _recover_index_from_filesystem,
     _replace_index,
 )
+from pnqi.lock import acquire_index_lock, lock_paths
 from pnqi.pathing import normalize_windows_path, sqlite_like_from_star_pattern
+from pnqi.progress import CancellationToken
 from pnqi.winapi import ERROR_JOURNAL_ENTRY_DELETED, FILE_ATTRIBUTE_DIRECTORY, read_usn_changes
 
 
@@ -56,8 +61,23 @@ class PathingTests(unittest.TestCase):
             "c:\\\\users\\\\%\\\\desktop\\\\%",
         )
 
+    def test_posix_path_helpers_preserve_forward_slashes(self) -> None:
+        with (
+            patch("pnqi.pathing.is_windows", return_value=False),
+            patch("pnqi.db.is_windows", return_value=False),
+        ):
+            self.assertEqual(normalize_windows_path("/mnt/ntfs//Users"), "/mnt/ntfs/Users")
+            self.assertEqual(sqlite_like_from_star_pattern("/mnt/ntfs/*/Desktop/*"), "/mnt/ntfs/%/desktop/%")
+
     def test_cli_drive_pattern_resolves_relative_patterns(self) -> None:
         self.assertEqual(_pattern_in_drive("C:\\", "Users\\*"), "C:\\Users\\*")
+
+    def test_cli_drive_pattern_resolves_posix_relative_patterns(self) -> None:
+        with (
+            patch("pnqi.cli.is_windows", return_value=False),
+            patch("pnqi.pathing.is_windows", return_value=False),
+        ):
+            self.assertEqual(_pattern_in_drive("/mnt/ntfs", "Users/*"), "/mnt/ntfs/Users/*")
 
     def test_cli_drive_pattern_rejects_other_drives(self) -> None:
         with self.assertRaises(PnqiError):
@@ -370,6 +390,75 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(metadata["root_frn"], "1")
             finally:
                 conn.close()
+
+    def test_portable_filesystem_build_writes_sqlite_index(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = normalize_windows_path(str(Path(temp_dir) / "root"))
+            Path(root).mkdir()
+            file_path = normalize_windows_path(str(Path(root) / "file.txt"))
+            Path(file_path).write_text("hello", encoding="utf-8")
+            final_path = normalize_windows_path(str(Path(temp_dir) / "pnqi.index.sqlite"))
+            volume = SimpleNamespace(root=normalize_windows_path(temp_dir), serial=123, filesystem="NTFS")
+
+            def fake_get_file_id(path: str) -> SimpleNamespace:
+                normalized = normalize_windows_path(path)
+                if normalized == root:
+                    return SimpleNamespace(frn="root", volume_serial=123, attributes=FILE_ATTRIBUTE_DIRECTORY)
+                if normalized == file_path:
+                    return SimpleNamespace(frn="file", volume_serial=123, attributes=0)
+                return SimpleNamespace(frn="parent", volume_serial=123, attributes=FILE_ATTRIBUTE_DIRECTORY)
+
+            with (
+                patch(
+                    "pnqi.indexer._resolve_index_path_for_existing_path",
+                    return_value=(root, final_path, volume),
+                ),
+                patch("pnqi.indexer.get_file_id", side_effect=fake_get_file_id),
+                patch("pnqi.indexer._uses_windows_ntfs_backend", return_value=False),
+            ):
+                result = _build_index_from_filesystem(root, commit=True, token=CancellationToken())
+
+            self.assertEqual(result, final_path)
+            self.assertTrue(Path(final_path).exists())
+            conn = connect(final_path, readonly=True)
+            try:
+                entry = entry_by_frn(conn, "file")
+                self.assertIsNotNone(entry)
+                self.assertEqual(entry.path, file_path)  # type: ignore[union-attr]
+            finally:
+                conn.close()
+
+    def test_index_work_lock_writes_status_and_releases(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {"PNQI_STATE_DIR": temp_dir}):
+                lock_path, status_path = lock_paths()
+
+                with acquire_index_lock(
+                    "test-operation",
+                    "C:\\pnqi.index.sqlite",
+                    token=CancellationToken(),
+                ):
+                    self.assertTrue(lock_path.exists())
+                    self.assertTrue(status_path.exists())
+                    status = json.loads(status_path.read_text(encoding="utf-8"))
+                    self.assertEqual(status["operation"], "test-operation")
+                    self.assertEqual(status["target"], "C:\\pnqi.index.sqlite")
+
+                self.assertFalse(lock_path.exists())
+                self.assertFalse(status_path.exists())
+
+    def test_index_work_lock_recovers_stale_status(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {"PNQI_STATE_DIR": temp_dir}):
+                lock_path, status_path = lock_paths()
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                stale = {"pid": -1, "operation": "old", "target": "stale"}
+                lock_path.write_text(json.dumps(stale), encoding="utf-8")
+                status_path.write_text(json.dumps(stale), encoding="utf-8")
+
+                with acquire_index_lock("new", "target", token=CancellationToken()):
+                    status = json.loads(status_path.read_text(encoding="utf-8"))
+                    self.assertEqual(status["operation"], "new")
 
 
 if __name__ == "__main__":

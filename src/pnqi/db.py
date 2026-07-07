@@ -11,7 +11,8 @@ from pathlib import Path
 from . import __app_name__, __version__
 from .errors import IndexInvalidError, IndexNotFoundError, OperationCancelled
 from .formatting import human_size
-from .pathing import normalize_for_match, normalize_windows_path
+from .pathing import join_windows_path, normalize_for_match, normalize_windows_path
+from .platform import is_windows
 from .progress import CancellationToken, ProgressCallback, ProgressUpdate, report
 
 SCHEMA_VERSION = "1"
@@ -270,10 +271,11 @@ def update_ancestor_sizes(conn: sqlite3.Connection, parent_frn: str, delta: int)
 
 
 def _path_depth(path: str) -> int:
-    stripped = normalize_windows_path(path).rstrip("\\")
+    separator = "\\" if is_windows() else "/"
+    stripped = normalize_windows_path(path).rstrip(separator)
     if not stripped:
         return 0
-    return stripped.count("\\")
+    return stripped.count(separator)
 
 
 def recompute_tree_sizes(
@@ -354,7 +356,7 @@ def refresh_descendant_paths(conn: sqlite3.Connection, root_frn: str) -> None:
             (parent.frn, parent.frn),
         ).fetchall()
         for row in child_rows:
-            path = parent.path.rstrip("\\") + "\\" + row["name"]
+            path = join_windows_path(parent.path, row["name"])
             path_norm = normalize_for_match(path)
             conflicting = conn.execute(
                 "SELECT frn FROM entries WHERE path_norm = ? AND frn != ?",

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import ctypes
+import os
+import stat
 from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
 
-from .errors import IndexInvalidError, NotNtfsError, PnqiError
+from .errors import IndexInvalidError, NotNtfsError, PlatformNotSupportedError, PnqiError
 from .pathing import normalize_windows_path
+from .platform import is_windows
 
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if is_windows() else None
 
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
@@ -111,7 +115,7 @@ class VolumeInfo:
 
 @dataclass(frozen=True)
 class FileIdInfo:
-    frn: int
+    frn: int | str
     volume_serial: int
     attributes: int
 
@@ -136,56 +140,101 @@ class UsnRecord:
 
 
 def raise_last_error(context: str) -> None:
+    if kernel32 is None:
+        raise PlatformNotSupportedError(f"{context}: Win32 APIs are not available on this platform.")
     code = ctypes.get_last_error()
     raise PnqiError(f"{context}: Win32 error {code}: {ctypes.FormatError(code)}")
 
+if kernel32 is not None:
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    kernel32.DeviceIoControl.restype = wintypes.BOOL
+    kernel32.GetVolumePathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    kernel32.GetVolumePathNameW.restype = wintypes.BOOL
+    kernel32.GetVolumeInformationW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    kernel32.GetVolumeInformationW.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(BY_HANDLE_FILE_INFORMATION),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetLogicalDrives.argtypes = []
+    kernel32.GetLogicalDrives.restype = wintypes.DWORD
 
-kernel32.CreateFileW.argtypes = [
-    wintypes.LPCWSTR,
-    wintypes.DWORD,
-    wintypes.DWORD,
-    wintypes.LPVOID,
-    wintypes.DWORD,
-    wintypes.DWORD,
-    wintypes.HANDLE,
-]
-kernel32.CreateFileW.restype = wintypes.HANDLE
-kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-kernel32.CloseHandle.restype = wintypes.BOOL
-kernel32.DeviceIoControl.argtypes = [
-    wintypes.HANDLE,
-    wintypes.DWORD,
-    wintypes.LPVOID,
-    wintypes.DWORD,
-    wintypes.LPVOID,
-    wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD),
-    wintypes.LPVOID,
-]
-kernel32.DeviceIoControl.restype = wintypes.BOOL
-kernel32.GetVolumePathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
-kernel32.GetVolumePathNameW.restype = wintypes.BOOL
-kernel32.GetVolumeInformationW.argtypes = [
-    wintypes.LPCWSTR,
-    wintypes.LPWSTR,
-    wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD),
-    ctypes.POINTER(wintypes.DWORD),
-    ctypes.POINTER(wintypes.DWORD),
-    wintypes.LPWSTR,
-    wintypes.DWORD,
-]
-kernel32.GetVolumeInformationW.restype = wintypes.BOOL
-kernel32.GetFileInformationByHandle.argtypes = [
-    wintypes.HANDLE,
-    ctypes.POINTER(BY_HANDLE_FILE_INFORMATION),
-]
-kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
-kernel32.GetLogicalDrives.argtypes = []
-kernel32.GetLogicalDrives.restype = wintypes.DWORD
+
+def _require_windows_api() -> None:
+    if kernel32 is None:
+        raise PlatformNotSupportedError("This operation requires Windows NTFS APIs.")
+
+
+def _mount_root(path: str) -> str:
+    current = Path(path).resolve(strict=True)
+    if current.is_file():
+        current = current.parent
+    while current.parent != current and not os.path.ismount(current):
+        current = current.parent
+    return normalize_windows_path(str(current))
+
+
+def _mounted_filesystems() -> dict[str, str]:
+    mounts: dict[str, str] = {}
+    proc_mounts = Path("/proc/mounts")
+    if proc_mounts.exists():
+        try:
+            for line in proc_mounts.read_text(encoding="utf-8", errors="replace").splitlines():
+                parts = line.split()
+                if len(parts) >= 3:
+                    mounts[normalize_windows_path(parts[1])] = parts[2].upper()
+        except OSError:
+            pass
+    return mounts
+
+
+def _generic_logical_roots() -> list[str]:
+    roots = {"/"}
+    roots.update(_mounted_filesystems())
+    for parent in (Path("/Volumes"), Path("/mnt"), Path("/media")):
+        if not parent.is_dir():
+            continue
+        try:
+            roots.update(normalize_windows_path(str(child)) for child in parent.iterdir() if child.is_dir())
+        except OSError:
+            continue
+    return sorted(roots)
 
 
 def logical_drive_roots() -> list[str]:
+    if kernel32 is None:
+        return _generic_logical_roots()
     mask = int(kernel32.GetLogicalDrives())
     if mask == 0:
         raise_last_error("GetLogicalDrives failed")
@@ -193,6 +242,15 @@ def logical_drive_roots() -> list[str]:
 
 
 def get_volume_info(path: str) -> VolumeInfo:
+    if kernel32 is None:
+        root = _mount_root(path)
+        filesystems = _mounted_filesystems()
+        filesystem = filesystems.get(root, "UNKNOWN")
+        try:
+            serial = int(os.stat(root).st_dev)
+        except OSError:
+            serial = 0
+        return VolumeInfo(root=root, device=root, serial=serial, filesystem=filesystem)
     buffer = ctypes.create_unicode_buffer(32768)
     if not kernel32.GetVolumePathNameW(path, buffer, len(buffer)):
         raise_last_error("GetVolumePathNameW failed")
@@ -213,6 +271,7 @@ def get_volume_info(path: str) -> VolumeInfo:
 
 
 def open_volume(volume: VolumeInfo) -> Handle:
+    _require_windows_api()
     handle = kernel32.CreateFileW(
         volume.device,
         GENERIC_READ | GENERIC_WRITE,
@@ -226,6 +285,7 @@ def open_volume(volume: VolumeInfo) -> Handle:
 
 
 def open_path_for_info(path: str) -> Handle:
+    _require_windows_api()
     handle = kernel32.CreateFileW(
         path,
         FILE_READ_ATTRIBUTES,
@@ -239,6 +299,14 @@ def open_path_for_info(path: str) -> Handle:
 
 
 def get_file_id(path: str) -> FileIdInfo:
+    if kernel32 is None:
+        stat_result = os.stat(path, follow_symlinks=False)
+        attributes = FILE_ATTRIBUTE_DIRECTORY if stat.S_ISDIR(stat_result.st_mode) else 0
+        return FileIdInfo(
+            frn=f"{int(stat_result.st_dev)}:{int(stat_result.st_ino)}",
+            volume_serial=int(stat_result.st_dev),
+            attributes=attributes,
+        )
     with open_path_for_info(path) as handle:
         info = BY_HANDLE_FILE_INFORMATION()
         if not kernel32.GetFileInformationByHandle(handle.value, ctypes.byref(info)):

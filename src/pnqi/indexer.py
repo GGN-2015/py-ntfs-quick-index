@@ -3,6 +3,7 @@ from __future__ import annotations
 import ntpath
 import os
 import string
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,7 @@ from .db import (
     validate_index,
 )
 from .errors import IndexInvalidError, IndexNotFoundError, PnqiError
+from .lock import acquire_index_lock
 from .pathing import (
     absolute_existing_path,
     absolute_pattern,
@@ -40,7 +42,7 @@ from .pathing import (
     sqlite_like_from_star_pattern,
     temporary_index_path,
 )
-from .platform import require_admin, validate_supported_platform
+from .platform import is_windows, require_admin, validate_supported_platform
 from .progress import CancellationToken, ProgressCallback, ProgressUpdate, report
 from .winapi import (
     FILE_ATTRIBUTE_DIRECTORY,
@@ -48,6 +50,7 @@ from .winapi import (
     enum_usn_records,
     get_file_id,
     get_volume_info,
+    logical_drive_roots,
     open_volume,
     query_usn_journal,
     read_usn_changes,
@@ -95,19 +98,25 @@ def _is_dir(attributes: int) -> bool:
     return bool(attributes & FILE_ATTRIBUTE_DIRECTORY)
 
 
+def _uses_windows_ntfs_backend() -> bool:
+    return is_windows()
+
+
 def _path_depth(path: str) -> int:
-    stripped = normalize_windows_path(path).rstrip("\\")
+    separator = "\\" if _uses_windows_ntfs_backend() else "/"
+    stripped = normalize_windows_path(path).rstrip(separator)
     if not stripped:
         return 0
-    return stripped.count("\\")
+    return stripped.count(separator)
 
 
 def _is_under(path: str, root: str) -> bool:
     path_norm = normalize_for_match(path)
     root_norm = normalize_for_match(root)
-    if root_norm.endswith("\\"):
+    separator = "\\" if _uses_windows_ntfs_backend() else "/"
+    if root_norm.endswith(separator):
         return path_norm.startswith(root_norm)
-    return path_norm == root_norm or path_norm.startswith(root_norm + "\\")
+    return path_norm == root_norm or path_norm.startswith(root_norm + separator)
 
 
 def _display_name_for_root(root_path: str) -> str:
@@ -230,7 +239,8 @@ def _stat_entry(
         stat_result = os.stat(path, follow_symlinks=False)
     except OSError:
         return None
-    is_dir = _is_dir(attributes) or bool(stat_result.st_file_attributes & FILE_ATTRIBUTE_DIRECTORY)
+    stat_attributes = int(getattr(stat_result, "st_file_attributes", attributes))
+    is_dir = _is_dir(attributes) or bool(stat_attributes & FILE_ATTRIBUTE_DIRECTORY)
     size = 0 if is_dir else int(stat_result.st_size)
     return Entry(
         frn=frn,
@@ -241,13 +251,22 @@ def _stat_entry(
         size=size,
         tree_size=size,
         mtime_ns=int(stat_result.st_mtime_ns),
-        attributes=int(getattr(stat_result, "st_file_attributes", attributes)),
+        attributes=stat_attributes,
         usn=int(usn),
     )
 
 
 def _volume_for_pattern(pattern: str):
     absolute = absolute_pattern(pattern)
+    if not _uses_windows_ntfs_backend():
+        prefix = absolute.split("*", 1)[0]
+        candidate = prefix if prefix.endswith("/") else os.path.dirname(prefix)
+        while candidate and not os.path.exists(candidate):
+            parent = os.path.dirname(candidate)
+            if parent == candidate:
+                break
+            candidate = parent
+        return get_volume_info(candidate or "/")
     drive, _tail = ntpath.splitdrive(absolute)
     if not drive:
         raise PnqiError(f"Cannot determine volume for pattern: {pattern}")
@@ -262,12 +281,12 @@ def _resolve_index_path_for_existing_path(path: str) -> tuple[str, str, object]:
 
 def _parent_frn_for_existing_path(path: str, fallback_frn: str) -> str:
     normalized = normalize_windows_path(path)
-    if normalized.endswith("\\") and len(normalized) == 3:
+    if _uses_windows_ntfs_backend() and normalized.endswith("\\") and len(normalized) == 3:
         return fallback_frn
-    parent = ntpath.dirname(normalized.rstrip("\\"))
+    parent = ntpath.dirname(normalized.rstrip("\\")) if _uses_windows_ntfs_backend() else os.path.dirname(normalized)
     if not parent:
         return fallback_frn
-    if len(parent) == 2:
+    if _uses_windows_ntfs_backend() and len(parent) == 2:
         parent += "\\"
     try:
         return _frn(get_file_id(parent).frn)
@@ -314,8 +333,14 @@ def planned_staged_index(root_path: str) -> StagedIndex:
     return StagedIndex(final_path=final_path, temp_path=temporary_index_path(final_path))
 
 
-def commit_staged_index(staged: StagedIndex) -> str:
-    _replace_index(staged.temp_path, staged.final_path)
+def commit_staged_index(
+    staged: StagedIndex,
+    *,
+    progress: ProgressCallback | None = None,
+    token: CancellationToken | None = None,
+) -> str:
+    with acquire_index_lock("commit-index", staged.final_path, progress=progress, token=token):
+        _replace_index(staged.temp_path, staged.final_path)
     return staged.final_path
 
 
@@ -480,6 +505,80 @@ def _build_index(
         raise
 
 
+def _build_index_from_filesystem(
+    root_path: str,
+    *,
+    progress: ProgressCallback | None = None,
+    token: CancellationToken | None = None,
+    commit: bool,
+    staged: StagedIndex | None = None,
+) -> str | StagedIndex:
+    validate_supported_platform()
+    token = token or CancellationToken()
+    root_path, final_path, volume = _resolve_index_path_for_existing_path(root_path)
+    root_id = get_file_id(root_path)
+    root_frn = _frn(root_id.frn)
+    parent_frn = _parent_frn_for_existing_path(root_path, root_frn)
+    if staged is not None:
+        if normalize_for_match(staged.final_path) != normalize_for_match(final_path):
+            raise PnqiError("Staged index target does not match the requested folder.")
+        temp_path = staged.temp_path
+    else:
+        temp_path = temporary_index_path(final_path)
+    _cleanup_temp_index(temp_path)
+    report(progress, ProgressUpdate("start", 0, None, f"Index file: {final_path}"))
+
+    try:
+        high_usn = time.time_ns()
+        entries = _scan_filesystem_subtree(
+            root_path,
+            parent_frn=parent_frn,
+            volume_root=volume.root,
+            usn=high_usn,
+            progress=progress,
+            token=token,
+        )
+        conn = connect(temp_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            create_schema(conn)
+            count = bulk_insert_entries(conn, entries, progress=progress, token=token)
+            set_metadata(
+                conn,
+                app_name=__app_name__,
+                app_version=__version__,
+                schema_version="1",
+                volume_root=volume.root,
+                volume_serial=volume.serial,
+                filesystem=volume.filesystem,
+                root_path=root_path,
+                root_frn=root_frn,
+                journal_id=0,
+                indexed_usn=high_usn,
+                tree_size_version=TREE_SIZE_VERSION,
+                entry_count=count,
+            )
+            stamp_finished_metadata(conn, high_usn)
+            token.check()
+            conn.commit()
+            conn.execute("PRAGMA optimize")
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        token.check()
+        if commit:
+            _replace_index(temp_path, final_path)
+            report(progress, ProgressUpdate("done", count, count, f"Indexed {count:,} entries"))
+            return final_path
+        report(progress, ProgressUpdate("ready", count, count, f"Built {count:,} entries"))
+        return StagedIndex(final_path=final_path, temp_path=temp_path, entry_count=count)
+    except BaseException:
+        _cleanup_temp_index(temp_path)
+        raise
+
+
 def build_index(
     root_path: str,
     *,
@@ -487,7 +586,18 @@ def build_index(
     token: CancellationToken | None = None,
     staged: StagedIndex | None = None,
 ) -> str:
-    result = _build_index(root_path, progress=progress, token=token, commit=True, staged=staged)
+    _root_path, final_path, _volume = _resolve_index_path_for_existing_path(root_path)
+    with acquire_index_lock("build-index", final_path, progress=progress, token=token):
+        if _uses_windows_ntfs_backend():
+            result = _build_index(root_path, progress=progress, token=token, commit=True, staged=staged)
+        else:
+            result = _build_index_from_filesystem(
+                root_path,
+                progress=progress,
+                token=token,
+                commit=True,
+                staged=staged,
+            )
     if not isinstance(result, str):
         raise PnqiError("Internal error: index build returned an uncommitted staged index.")
     return result
@@ -500,7 +610,18 @@ def build_index_staged(
     token: CancellationToken | None = None,
     staged: StagedIndex | None = None,
 ) -> StagedIndex:
-    result = _build_index(root_path, progress=progress, token=token, commit=False, staged=staged)
+    _root_path, final_path, _volume = _resolve_index_path_for_existing_path(root_path)
+    with acquire_index_lock("build-index", final_path, progress=progress, token=token):
+        if _uses_windows_ntfs_backend():
+            result = _build_index(root_path, progress=progress, token=token, commit=False, staged=staged)
+        else:
+            result = _build_index_from_filesystem(
+                root_path,
+                progress=progress,
+                token=token,
+                commit=False,
+                staged=staged,
+            )
     if not isinstance(result, StagedIndex):
         raise PnqiError("Internal error: staged index build returned a committed path.")
     return result
@@ -556,9 +677,14 @@ def _recover_index_from_filesystem(
     if root_id.volume_serial != int(volume.serial):
         raise IndexInvalidError("The indexed root is no longer on the indexed volume; create a new index.")
 
-    with open_volume(volume) as handle:
-        journal = query_usn_journal(handle)
-    high_usn = journal.next_usn
+    if _uses_windows_ntfs_backend():
+        with open_volume(volume) as handle:
+            journal = query_usn_journal(handle)
+        high_usn = journal.next_usn
+        journal_id = journal.journal_id
+    else:
+        high_usn = time.time_ns()
+        journal_id = 0
     root_frn = _frn(root_id.frn)
     parent_frn = _parent_frn_for_existing_path(root_path, root_frn)
     try:
@@ -584,7 +710,7 @@ def _recover_index_from_filesystem(
             filesystem=volume.filesystem,
             root_path=root_path,
             root_frn=root_frn,
-            journal_id=journal.journal_id,
+            journal_id=journal_id,
             tree_size_version=TREE_SIZE_VERSION,
             entry_count=count,
         )
@@ -614,7 +740,14 @@ def _recover_and_replay_index(
         report(progress, ProgressUpdate("done", 0, 0, "Index was reconciled from the filesystem"))
         return index_path
     conn.close()
-    return update_index(path, progress=progress, token=token, _recovery_attempts=recovery_attempts + 1)
+    return _update_index_locked(
+        path,
+        volume,
+        index_path,
+        progress=progress,
+        token=token,
+        _recovery_attempts=recovery_attempts + 1,
+    )
 
 
 def _entry_from_record_path(
@@ -850,7 +983,52 @@ def update_index(
     volume = get_volume_info(absolute)
     index_path = index_path_for_volume(volume.root)
     require_index(index_path)
+    with acquire_index_lock("update-index", index_path, progress=progress, token=token):
+        if not _uses_windows_ntfs_backend():
+            return _update_index_from_filesystem_locked(
+                volume,
+                index_path,
+                progress=progress,
+                token=token,
+            )
+        return _update_index_locked(
+            absolute,
+            volume,
+            index_path,
+            progress=progress,
+            token=token,
+            _recovery_attempts=_recovery_attempts,
+        )
 
+
+def _update_index_from_filesystem_locked(
+    volume,
+    index_path: str,
+    *,
+    progress: ProgressCallback | None,
+    token: CancellationToken,
+) -> str:
+    conn = connect(index_path)
+    try:
+        meta = validate_index(conn)
+        if normalize_for_match(meta["volume_root"]) != normalize_for_match(volume.root):
+            raise IndexInvalidError(f"Index {index_path} belongs to {meta['volume_root']}, not {volume.root}.")
+        _recover_index_from_filesystem(conn, meta, volume=volume, progress=progress, token=token)
+        report(progress, ProgressUpdate("done", 0, 0, "Index was refreshed from the filesystem"))
+        return index_path
+    finally:
+        conn.close()
+
+
+def _update_index_locked(
+    absolute: str,
+    volume,
+    index_path: str,
+    *,
+    progress: ProgressCallback | None,
+    token: CancellationToken,
+    _recovery_attempts: int = 0,
+) -> str:
     conn = connect(index_path)
     try:
         meta = validate_index(conn)
@@ -1150,6 +1328,17 @@ def refresh_known_indexes(
 ) -> list[str]:
     token = token or CancellationToken()
     refreshed: list[str] = []
+    if not _uses_windows_ntfs_backend():
+        for root in logical_drive_roots():
+            token.check()
+            index_path = index_path_for_volume(root)
+            if not os.path.exists(index_path):
+                continue
+            try:
+                refreshed.append(update_index(root, progress=progress, token=token))
+            except (IndexInvalidError, IndexNotFoundError, PnqiError):
+                continue
+        return refreshed
     for drive in string.ascii_uppercase:
         token.check()
         root = f"{drive}:\\"

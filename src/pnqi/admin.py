@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from .errors import NotAdminError
-from .platform import is_admin, validate_supported_platform
+from .platform import is_admin, is_windows, validate_supported_platform
 
 ELEVATED_CHILD_FLAG = "--pnqi-elevated-child"
 
@@ -22,6 +22,8 @@ def ensure_startup_admin(argv: Sequence[str] | None = None, *, gui: bool = False
     """
 
     validate_supported_platform()
+    if not is_windows():
+        return True
     args = list(sys.argv[1:] if argv is None else argv)
     if is_admin():
         return True
