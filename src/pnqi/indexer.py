@@ -376,7 +376,7 @@ def _build_index(
 
     try:
         with open_volume(volume) as handle:
-            journal = query_usn_journal(handle)
+            journal = query_usn_journal(handle, volume=volume)
             high_usn = journal.next_usn
             records: dict[str, _MftRecord] = {}
             report(progress, ProgressUpdate("mft", 0, None, "Reading NTFS MFT records"))
@@ -679,7 +679,7 @@ def _recover_index_from_filesystem(
 
     if _uses_windows_ntfs_backend():
         with open_volume(volume) as handle:
-            journal = query_usn_journal(handle)
+            journal = query_usn_journal(handle, volume=volume)
         high_usn = journal.next_usn
         journal_id = journal.journal_id
     else:
@@ -1039,7 +1039,7 @@ def _update_index_locked(
         if meta["filesystem"].upper() != "NTFS":
             raise IndexInvalidError("Index was not created for an NTFS volume.")
         with open_volume(volume) as handle:
-            journal = query_usn_journal(handle)
+            journal = query_usn_journal(handle, volume=volume)
             indexed_usn = int(meta["indexed_usn"])
             if str(journal.journal_id) != meta["journal_id"]:
                 return _recover_and_replay_index(

@@ -7,10 +7,12 @@ import queue
 import sys
 import time
 import tkinter as tk
+import traceback
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Callable
 
 from .admin import ensure_startup_admin, without_elevated_flag
+from .diagnostics import write_error_log
 from .errors import OperationCancelled, PnqiError
 from .formatting import human_mtime, human_percent, human_size
 from .indexer import (
@@ -75,9 +77,21 @@ def _run_process_task(task: str, payload: Any, task_queue: Any, cancel_event: An
     except OperationCancelled:
         task_queue.put(("cancelled", None))
     except PnqiError as exc:
-        task_queue.put(("error", ("pnqi", exc.__class__.__name__, str(exc))))
+        task_queue.put(
+            ("error", ("pnqi", exc.__class__.__name__, str(exc), traceback.format_exc()))
+        )
     except BaseException as exc:
-        task_queue.put(("error", ("unexpected", exc.__class__.__name__, str(exc) or repr(exc))))
+        task_queue.put(
+            (
+                "error",
+                (
+                    "unexpected",
+                    exc.__class__.__name__,
+                    str(exc) or repr(exc),
+                    traceback.format_exc(),
+                ),
+            )
+        )
     else:
         task_queue.put(("done", result))
 
@@ -112,6 +126,69 @@ class _DriveSelectDialog(simpledialog.Dialog):
 
     def apply(self) -> None:
         self.result = self.drive_var.get().strip()
+
+
+class _ErrorLogDialog(simpledialog.Dialog):
+    def __init__(self, parent: tk.Misc, message: str, log_path: str) -> None:
+        self.message = message
+        self.log_path = log_path
+        super().__init__(parent, "pnqi")
+
+    def body(self, master: tk.Widget) -> tk.Widget:
+        master.columnconfigure(0, weight=1)
+        ttk.Label(master, text=self.message, wraplength=560, justify="left").grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            pady=(0, 10),
+        )
+        ttk.Label(master, text="Full traceback log").grid(row=1, column=0, sticky="w")
+        self.path_var = tk.StringVar(value=self.log_path)
+        entry = ttk.Entry(master, textvariable=self.path_var, width=72)
+        entry.grid(row=2, column=0, sticky="ew", pady=(2, 0))
+        entry.configure(state="readonly")
+        return entry
+
+    def buttonbox(self) -> None:
+        box = ttk.Frame(self)
+        copy_button = ttk.Button(box, text="Copy Log Path", command=self._copy_log_path)
+        copy_button.pack(side=tk.LEFT, padx=(0, 6), pady=6)
+        ok_button = ttk.Button(box, text="OK", width=10, command=self.ok, default=tk.ACTIVE)
+        ok_button.pack(side=tk.LEFT, pady=6)
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+        box.pack()
+
+    def _copy_log_path(self) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(self.log_path)
+        self.update_idletasks()
+
+
+def _show_logged_error(
+    parent: tk.Misc | None,
+    message: str,
+    *,
+    error_type: str,
+    traceback_text: str,
+    context: dict[str, object] | None = None,
+) -> str:
+    log_path = write_error_log(
+        error_type=error_type,
+        message=message,
+        traceback_text=traceback_text,
+        context=context,
+    )
+    if parent is None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            _ErrorLogDialog(root, message, log_path)
+        finally:
+            root.destroy()
+    else:
+        _ErrorLogDialog(parent, message, log_path)
+    return log_path
 
 
 class PnqiApp(tk.Tk):
@@ -274,7 +351,13 @@ class PnqiApp(tk.Tk):
         try:
             drives = logical_drive_roots()
         except PnqiError as exc:
-            messagebox.showerror("pnqi", str(exc))
+            _show_logged_error(
+                self,
+                str(exc),
+                error_type=exc.__class__.__name__,
+                traceback_text=traceback.format_exc(),
+                context={"task": "choose-drive"},
+            )
             if startup:
                 self.destroy()
             return
@@ -309,7 +392,13 @@ class PnqiApp(tk.Tk):
         try:
             staged = planned_staged_index(path)
         except PnqiError as exc:
-            messagebox.showerror("pnqi", str(exc))
+            _show_logged_error(
+                self,
+                str(exc),
+                error_type=exc.__class__.__name__,
+                traceback_text=traceback.format_exc(),
+                context={"task": "plan-index", "path": path},
+            )
             return
         self._run_task("Creating index", "index", (path, staged), self._after_index, staged_index=staged)
 
@@ -525,6 +614,7 @@ class PnqiApp(tk.Tk):
         self._set_locked(False)
         self._set_indeterminate(False)
         done = self._task_done
+        task_name = self._task_name
         staged = self._task_staged_index
         self._task_done = None
         self._task_name = None
@@ -543,7 +633,13 @@ class PnqiApp(tk.Tk):
             self._status_var.set("Error")
             if staged is not None:
                 discard_staged_index(staged)
-            messagebox.showerror("pnqi", str(exc))
+            _show_logged_error(
+                self,
+                str(exc),
+                error_type=exc.__class__.__name__,
+                traceback_text=traceback.format_exc(),
+                context={"task": "finish-task", "task_name": task_name or ""},
+            )
 
     def _finish_cancelled_task(self) -> None:
         if self._task_process is not None and self._task_process.is_alive():
@@ -585,6 +681,7 @@ class PnqiApp(tk.Tk):
         error_kind = payload[0] if len(payload) >= 1 else "unexpected"
         error_type = payload[1] if len(payload) >= 3 else "PnqiError"
         message = payload[2] if len(payload) >= 3 else payload[-1]
+        traceback_text = payload[3] if len(payload) >= 4 else ""
         if error_kind == "pnqi":
             self._status_var.set("Error")
             if (
@@ -601,10 +698,22 @@ class PnqiApp(tk.Tk):
                 if create:
                     self._create_index()
             else:
-                messagebox.showerror("pnqi", message)
+                _show_logged_error(
+                    self,
+                    message,
+                    error_type=error_type,
+                    traceback_text=traceback_text,
+                    context={"task": task_name or "", "payload": task_payload or ""},
+                )
         else:
             self._status_var.set("Unexpected error")
-            messagebox.showerror("pnqi", f"{error_type}: {message}")
+            _show_logged_error(
+                self,
+                f"{error_type}: {message}",
+                error_type=error_type,
+                traceback_text=traceback_text,
+                context={"task": task_name or "", "payload": task_payload or ""},
+            )
 
     def _close(self) -> None:
         if self._task_process is not None and self._task_process.is_alive():
@@ -734,7 +843,13 @@ def main(argv: list[str] | None = None) -> int:
         app.mainloop()
         return 0
     except PnqiError as exc:
-        messagebox.showerror("pnqi", str(exc))
+        _show_logged_error(
+            None,
+            str(exc),
+            error_type=exc.__class__.__name__,
+            traceback_text=traceback.format_exc(),
+            context={"task": "startup"},
+        )
         return 1
 
 

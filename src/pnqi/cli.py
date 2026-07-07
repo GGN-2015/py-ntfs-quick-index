@@ -4,12 +4,14 @@ import argparse
 import ntpath
 import os
 import sys
+import traceback
 from collections.abc import Callable
 from typing import Any
 
 from tqdm import tqdm
 
 from .admin import ELEVATED_CHILD_FLAG, ensure_startup_admin, without_elevated_flag
+from .diagnostics import write_error_log
 from .errors import OperationCancelled, PnqiError
 from .formatting import human_mtime, human_percent, human_size
 from .indexer import browse_children, build_index, list_sizes, refresh_known_indexes, search, update_index
@@ -263,7 +265,14 @@ def run(argv: list[str] | None = None) -> int:
         print("Cancelled.", file=sys.stderr)
         return 130
     except PnqiError as exc:
+        log_path = write_error_log(
+            error_type=exc.__class__.__name__,
+            message=str(exc),
+            traceback_text=traceback.format_exc(),
+            context={"command": args.command or ""},
+        )
         print(f"pnqi: {exc}", file=sys.stderr)
+        print(f"Full traceback log: {log_path}", file=sys.stderr)
         return 1
     finally:
         progress.close()

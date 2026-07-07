@@ -270,11 +270,12 @@ def get_volume_info(path: str) -> VolumeInfo:
     return VolumeInfo(root=root, device=f"\\\\.\\{drive}", serial=int(serial.value), filesystem=filesystem)
 
 
-def open_volume(volume: VolumeInfo) -> Handle:
+def open_volume(volume: VolumeInfo, *, writable: bool = False) -> Handle:
     _require_windows_api()
+    access = GENERIC_READ | (GENERIC_WRITE if writable else 0)
     handle = kernel32.CreateFileW(
         volume.device,
-        GENERIC_READ | GENERIC_WRITE,
+        access,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         None,
         OPEN_EXISTING,
@@ -352,11 +353,16 @@ def create_usn_journal_if_needed(handle: Handle) -> None:
         raise PnqiError(f"FSCTL_CREATE_USN_JOURNAL failed: Win32 error {error}: {ctypes.FormatError(error)}")
 
 
-def query_usn_journal(handle: Handle) -> JournalInfo:
+def query_usn_journal(handle: Handle, *, volume: VolumeInfo | None = None) -> JournalInfo:
     data = USN_JOURNAL_DATA_V0()
     ok, _returned, error = _device_io_control(handle, FSCTL_QUERY_USN_JOURNAL, None, data)
     if not ok and error == ERROR_JOURNAL_NOT_ACTIVE:
-        create_usn_journal_if_needed(handle)
+        if volume is None:
+            create_usn_journal_if_needed(handle)
+        else:
+            with open_volume(volume, writable=True) as write_handle:
+                create_usn_journal_if_needed(write_handle)
+        data = USN_JOURNAL_DATA_V0()
         ok, _returned, error = _device_io_control(handle, FSCTL_QUERY_USN_JOURNAL, None, data)
     if not ok:
         raise PnqiError(f"FSCTL_QUERY_USN_JOURNAL failed: Win32 error {error}: {ctypes.FormatError(error)}")

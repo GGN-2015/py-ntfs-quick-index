@@ -21,6 +21,7 @@ from pnqi.db import (
     upsert_entry,
 )
 from pnqi.cli import _pattern_in_drive, _validate_limit
+from pnqi.diagnostics import write_error_log
 from pnqi.errors import IndexInvalidError, PnqiError
 from pnqi.formatting import human_mtime, human_percent, human_size
 from pnqi.indexer import (
@@ -33,7 +34,13 @@ from pnqi.indexer import (
 from pnqi.lock import acquire_index_lock, lock_paths
 from pnqi.pathing import normalize_windows_path, sqlite_like_from_star_pattern
 from pnqi.progress import CancellationToken
-from pnqi.winapi import ERROR_JOURNAL_ENTRY_DELETED, FILE_ATTRIBUTE_DIRECTORY, read_usn_changes
+from pnqi.winapi import (
+    ERROR_JOURNAL_ENTRY_DELETED,
+    ERROR_JOURNAL_NOT_ACTIVE,
+    FILE_ATTRIBUTE_DIRECTORY,
+    query_usn_journal,
+    read_usn_changes,
+)
 
 
 class FormattingTests(unittest.TestCase):
@@ -336,6 +343,58 @@ class DatabaseTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(IndexInvalidError, "create a new index"):
                 list(read_usn_changes(handle, journal_id=1, start_usn=1, stop_usn=2))
+
+    def test_query_usn_journal_creates_missing_journal_with_writable_handle(self) -> None:
+        handle = SimpleNamespace(value=1)
+        volume = SimpleNamespace(device="\\\\.\\C:", root="C:\\", serial=123, filesystem="NTFS")
+        writable_context = MagicMock()
+        writable_context.__enter__.return_value = SimpleNamespace(value=2)
+        writable_context.__exit__.return_value = None
+        query_count = 0
+
+        def fake_device_io_control(  # type: ignore[no-untyped-def]
+            handle,
+            code,
+            in_buffer,
+            out_buffer,
+        ):
+            nonlocal query_count
+            if out_buffer is None:
+                return True, 0, 0
+            query_count += 1
+            if query_count == 1:
+                return False, 0, ERROR_JOURNAL_NOT_ACTIVE
+            out_buffer.UsnJournalID = 77
+            out_buffer.NextUsn = 50
+            out_buffer.LowestValidUsn = 10
+            return True, 0, 0
+
+        with (
+            patch("pnqi.winapi._device_io_control", side_effect=fake_device_io_control),
+            patch("pnqi.winapi.open_volume", return_value=writable_context) as open_volume_mock,
+        ):
+            journal = query_usn_journal(handle, volume=volume)
+
+        open_volume_mock.assert_called_once_with(volume, writable=True)
+        self.assertEqual(journal.journal_id, 77)
+        self.assertEqual(journal.next_usn, 50)
+        self.assertEqual(journal.lowest_valid_usn, 10)
+
+    def test_error_log_writes_traceback_and_context(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, {"PNQI_LOG_DIR": temp_dir}):
+                path = write_error_log(
+                    error_type="PnqiError",
+                    message="boom",
+                    traceback_text="Traceback line\nPnqiError: boom\n",
+                    context={"task": "unit-test"},
+                )
+
+            text = Path(path).read_text(encoding="utf-8")
+            self.assertIn("Error type: PnqiError", text)
+            self.assertIn("Message: boom", text)
+            self.assertIn("task: unit-test", text)
+            self.assertIn("Traceback line", text)
 
     def test_recover_index_from_filesystem_replaces_stale_entries(self) -> None:
         with TemporaryDirectory() as temp_dir:
